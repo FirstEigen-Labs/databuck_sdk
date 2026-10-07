@@ -1,0 +1,3 @@
+include README.md
+include RELEASING.md
+recursive-include databuck/jars *.jar
