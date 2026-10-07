@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "databuck-spark"
+version = "0.5.0"
+description = "DataBuck data quality SDK for PySpark and Databricks"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["data quality", "databricks", "pyspark", "data profiling"]
+classifiers = [
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+]
+dependencies = [
+  "google-genai>=1.0.0",
+]
+authors = [
+  { name = "DataBuck" }
+]
+
+[project.urls]
+Repository = "https://github.com/angsumandutta/databuck-python"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["databuck*"]
+
+[tool.setuptools.package-data]
+databuck = ["jars/*.jar"]
