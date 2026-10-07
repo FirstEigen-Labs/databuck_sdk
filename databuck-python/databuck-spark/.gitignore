@@ -1,8 +1,0 @@
-/build/
-/dist/
-/dist-publish-*/
-/dist-release-*/
-/*.egg-info/
-/databuck/jars/*.jar
-__pycache__/
-*.py[cod]
