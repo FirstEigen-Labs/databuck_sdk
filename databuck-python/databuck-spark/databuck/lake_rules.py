@@ -80,9 +80,9 @@ class DiscoveredRules(list):
                 context_rules=None):
         """Export expectations grouped by action.
 
-        Pass both ``df`` and business ``context`` to have Gemini select actions
-        using the discovered rules and a small sample of the DataFrame. Without
-        context, every rule defaults to the non-destructive ``warn`` action.
+        Pass ``df`` and ``context`` to have Gemini select actions using the
+        discovered rules and a small sample of the DataFrame. Business context
+        is optional. Without context, every rule defaults to ``warn``.
         """
         expectations = {}
         for rule in self:
@@ -155,11 +155,11 @@ class DiscoveredRules(list):
         if not expectations:
             raise ValueError("No Databricks expectations are available to export")
         if context is None:
-            decisions = {name: {"action": "warn", "reason": "No business context supplied."}
+            decisions = {name: {"action": "warn", "reason": "No action classification requested."}
                          for name in expectations}
         else:
             if df is None:
-                raise ValueError("A DataFrame is required to classify actions from business context")
+                raise ValueError("A DataFrame is required to classify rule actions")
             decisions = _classify_actions_with_llm(expectations, df, context)
 
         grouped = {action: {} for action in _ACTIONS}
@@ -208,21 +208,23 @@ def _classify_actions_with_llm(expectations, df, context):
 
     sample = [json.loads(row) for row in df.limit(5).toJSON().collect()]
     business_context = {key: value for key, value in context.items()
-                        if key not in {"gemini_api_key", "gemini_model"}}
+                        if key not in {"gemini_api_key", "gemini_model", "pdf_paths",
+                                       "rule_count", "include_failed_rules"}}
     prompt = """Classify each DataBuck row expectation for a Databricks pipeline.
 Return only a JSON array with one object for every expectation, containing
 exactly: name, action, reason. Use the exact expectation names provided.
 
 Allowed actions:
 - warn: keep invalid rows and record quality metrics.
-- drop: discard invalid rows because the business context shows that those
-  individual rows cannot safely continue, while the pipeline can continue.
-- fail: stop the pipeline update because the business context shows that any
-  violation makes the entire update unacceptable.
+- drop: discard invalid individual rows while the pipeline can continue.
+- fail: stop the pipeline update when a violation makes the entire update
+  unacceptable.
 
-Use the business context to decide the action. The sample describes the data;
-it does not by itself authorize dropping rows or failing an update. If the
-context does not establish a clear enforcement consequence, choose warn.
+Decide from the expectation meaning, column names and types, the DataFrame
+sample, and any optional business context. Use your judgment to choose the
+appropriate action for each rule. A small sample does not establish business
+criticality by itself. Choose warn if the evidence does not justify drop or
+fail; reserve fail for violations that should stop the entire update.
 Do not change, omit, or invent rules. Explain each choice in reason.
 
 Business context:

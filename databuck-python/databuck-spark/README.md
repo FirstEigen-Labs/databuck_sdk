@@ -78,6 +78,9 @@ invalid-row SQL queries are converted to Lakeflow pass conditions. Only
 audited, passed BuckGPT rules in the required
 `SELECT * FROM {{DATAFRAME}} WHERE <invalid-row condition>` shape can be
 exported; an unsupported query fails the export.
+`business_context` is optional when `context` contains a Gemini key and any
+reference PDFs. Paths in `pdf_paths` must point to existing `.pdf` files;
+convert `.docx` documents to PDF before using them here.
 
 To export only automatic profiling rules, omit `context`:
 
@@ -90,8 +93,10 @@ json_path = DataBuck.discover_and_export(
 Without context, BuckGPT is not called and all exported rules use `warn`.
 
 The JSON contains three dictionaries: `warn`, `drop`, and `fail`. Gemini
-classifies every exported expectation using the business context, DataFrame
-schema, and up to five sample rows. This sends those inputs to Gemini. If an
+classifies every exported expectation using the rule expression, DataFrame
+schema, up to five sample rows, and any optional business context. PDF files
+are used for BuckGPT rule generation, not passed again to action classification.
+This sends the schema and sample to Gemini. If an
 LLM response is incomplete or invalid, export fails instead of assigning a
 destructive action.
 In a Lakeflow pipeline, use the dictionaries with `dp.expect_all`,
@@ -126,8 +131,8 @@ changes, then refresh the pipeline.
 }
 ```
 
-The example shows the file shape; the actual actions come from the supplied
-business context. `DataBuck.discover_rules(df)` and
+The example shows the file shape; the actual actions are chosen by Gemini.
+`DataBuck.discover_rules(df)` and
 `DataBuck.discover(df, context)` are still available separately. The new
 `DataBuck.discover_and_export(...)` call combines them.
 
