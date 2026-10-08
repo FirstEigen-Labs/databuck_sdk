@@ -1313,6 +1313,9 @@ class DataBuck:
             raise TypeError("context must be a dictionary or None")
 
         rules = DataBuck.discover_rules(df)
+        print("\nAuto-discovered DataBuck rules ({}):".format(len(rules)))
+        for index, rule in enumerate(rules, start=1):
+            print("Rule {}: {}".format(index, rule))
         context_rules = DataBuck.discover(df, context) if context is not None else None
         output_path = rules.to_lake(
             path, df=df, context=context, context_rules=context_rules

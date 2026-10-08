@@ -1,7 +1,9 @@
 import json
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,10 +22,14 @@ class CombinedExportTests(unittest.TestCase):
         }])
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "expectations.json"
+            output = io.StringIO()
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
                  patch.object(DataBuck, "discover") as discover_context:
-                DataBuck.discover_and_export(object(), str(destination))
+                with redirect_stdout(output):
+                    DataBuck.discover_and_export(object(), str(destination))
             discover_context.assert_not_called()
+            self.assertIn("Auto-discovered DataBuck rules (1)", output.getvalue())
+            self.assertIn("subscriber_id", output.getvalue())
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {
                 "warn": {"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"},
                 "drop": {},

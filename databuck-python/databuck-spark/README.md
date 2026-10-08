@@ -78,6 +78,9 @@ invalid-row SQL queries are converted to Lakeflow pass conditions. Only
 audited, passed BuckGPT rules in the required
 `SELECT * FROM {{DATAFRAME}} WHERE <invalid-row condition>` shape can be
 exported; an unsupported query fails the export.
+The call prints the auto-discovered rules and the BuckGPT rules before it
+exports them. Some auto-discovered rules may not be exportable as row-level
+Lakeflow expectations; the JSON contains only those that can be converted.
 `business_context` is optional when `context` contains a Gemini key and any
 reference documents. The existing `pdf_paths` field accepts `.pdf` and `.docx`
 files. PDF files are uploaded to Gemini; text from Word documents is extracted
