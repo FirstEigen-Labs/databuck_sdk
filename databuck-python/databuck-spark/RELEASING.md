@@ -10,11 +10,10 @@ python -m twine check dist-release-NEW_VERSION/*
 ```
 
 Inspect both generated files (`.whl` and `.tar.gz`) before upload. The wheel
-must contain the `databuck` package and its metadata. If you deliberately
-stage a JAR at `databuck/jars/databuck-spark-sdk.jar`, verify it is the intended
-runtime artifact and that both distributions remain below the project's PyPI
-file-size limit. Otherwise install the JAR separately and configure
-`DATABUCK_SPARK_SDK_JAR` at runtime.
+must contain the `databuck` package and its metadata. The JAR is downloaded
+when `databuck` is imported or by `python -m databuck` after installation. Check that its
+public S3 URL works without credentials before publishing. Do not stage the
+large JAR in the Python distribution.
 
 Once the release is reviewed, upload with:
 

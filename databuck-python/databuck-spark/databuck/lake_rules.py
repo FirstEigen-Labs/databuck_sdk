@@ -76,7 +76,8 @@ class DiscoveredRules(list):
         self._prepared_value_anomaly = specs
         return prepared
 
-    def to_lake(self, path_where_needs_to_export, *, df=None, context=None):
+    def to_lake(self, path_where_needs_to_export, *, df=None, context=None,
+                context_rules=None):
         """Export expectations grouped by action.
 
         Pass both ``df`` and business ``context`` to have Gemini select actions
@@ -147,6 +148,10 @@ class DiscoveredRules(list):
                  "{} IS NULL OR ({} IS NOT NULL AND ABS(CAST({} AS DOUBLE) - {}) <= {} * {})".format(
                      identifier, mean, identifier, mean, format(threshold, ".15g"), std))
 
+        for index, rule in enumerate(context_rules or (), start=1):
+            name = "BuckGPT_Rule_{:03d}".format(index)
+            expectations[name] = _context_rule_expectation(rule, name)
+
         if not expectations:
             raise ValueError("No Databricks expectations are available to export")
         if context is None:
@@ -162,6 +167,27 @@ class DiscoveredRules(list):
             grouped[decisions[name]["action"]][name] = expression
         self.action_decisions = decisions
         return write_expectations(grouped, path_where_needs_to_export)
+
+
+def _context_rule_expectation(rule, name):
+    """Turn an invalid-row query into a row-level Lakeflow pass condition."""
+    if not isinstance(rule, dict) or rule.get("audit_status") != "PASSED":
+        raise ValueError("{} must be an audited, passed context rule".format(name))
+    sql = str(rule.get("sql") or "").strip().rstrip(";").strip()
+    match = re.fullmatch(
+        r"SELECT\s+\*\s+FROM\s+\{\{DATAFRAME\}\}\s+WHERE\s+(.+)",
+        sql, flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        raise ValueError(
+            "{} must use SELECT * FROM {{{{DATAFRAME}}}} WHERE <invalid-row condition>"
+            .format(name)
+        )
+    invalid = match.group(1).strip()
+    if not invalid or ";" in invalid or "{{DATAFRAME}}" in invalid:
+        raise ValueError("{} has an invalid row condition".format(name))
+    # A WHERE clause selects only TRUE. FALSE and NULL both mean the row passes.
+    return "NOT COALESCE(({}), FALSE)".format(invalid)
 
 
 def _classify_actions_with_llm(expectations, df, context):

@@ -116,8 +116,10 @@ Reference requirements:
 SQL requirements:
 - Use generic SQL only. Do not use BigQuery, Databricks, Spark, Snowflake, or
   database-vendor-specific syntax.
-- Every SQL value must start with SELECT.
-- Use {placeholder} exactly as the source table placeholder.
+- Every SQL value must have exactly this shape:
+  SELECT * FROM {placeholder} WHERE <invalid-row condition>
+- The WHERE condition must use only columns from the supplied DataFrame.
+- Do not use joins, grouping, ordering, subqueries, or additional statements.
 - A rule must return invalid rows, so its WHERE clause must describe the
   condition that fails the rule.
 - Use only columns in the supplied schema.
@@ -207,6 +209,9 @@ Pass a rule only when all conditions are true:
 - Its reference_context exactly quotes one explicit reference statement.
 - Its SQL checks exactly the control stated in that reference.
 - The SQL uses only the supplied DataFrame columns.
+- The SQL has exactly this form: SELECT * FROM {placeholder} WHERE
+  <invalid-row condition>. It contains no joins, grouping, ordering,
+  subqueries, or additional statements.
 - The SQL does not invent formats, values, thresholds, relationships, or logic.
 - A "valid" reference has an explicit format, allowed-value list, or validation
   condition; null/empty SQL alone must fail such a rule.
@@ -222,6 +227,7 @@ Reference material:
 Candidate rules:
 {candidate_rules}
 """.format(
+        placeholder=DATAFRAME_PLACEHOLDER,
         reference_prompt=reference_prompt,
         candidate_rules=json.dumps(candidate_rules, indent=2),
     )

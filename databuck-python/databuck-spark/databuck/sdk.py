@@ -1,5 +1,16 @@
+import hashlib
 import os
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+import zipfile
 from pathlib import Path
+
+
+JAR_URL = "https://tmplog1-pub.s3.us-east-1.amazonaws.com/databuck-spark-sdk.jar"
+JAR_NAME = "databuck-spark-sdk.jar"
+JAR_SHA256 = "c85e35442f9416bdfbe69d66e3e786affa3b1861d526a1cf363bb25a34f470e6"
 
 
 class DataBuck:
@@ -8,12 +19,72 @@ class DataBuck:
     def jar_path() -> str:
         configured = os.environ.get("DATABUCK_SPARK_SDK_JAR")
         jar = (Path(configured).expanduser() if configured else
-               Path(__file__).resolve().parent / "jars" / "databuck-spark-sdk.jar")
+               Path(__file__).resolve().parent / "jars" / JAR_NAME)
         if not jar.is_file():
             raise FileNotFoundError(
-                "DataBuck Spark SDK JAR was not found at {}. Set "
-                "DATABUCK_SPARK_SDK_JAR to the local JAR path.".format(jar)
+                f"DataBuck Spark SDK JAR was not found at {jar}. "
+                "Run `python -m databuck` to download it, or set "
+                "DATABUCK_SPARK_SDK_JAR to an existing local JAR path."
             )
+        return str(jar.resolve())
+
+    @staticmethod
+    def download_jar(destination=None) -> str:
+        """Download the Spark JAR to the package path or a configured path."""
+        if destination is None:
+            configured = os.environ.get("DATABUCK_SPARK_SDK_JAR")
+            destination = (Path(configured).expanduser() if configured else
+                           Path(__file__).resolve().parent / "jars" / JAR_NAME)
+        jar = Path(destination).expanduser()
+        if jar.is_file():
+            return str(jar.resolve())
+
+        url = os.environ.get("DATABUCK_SPARK_SDK_JAR_URL", JAR_URL)
+        expected_sha256 = os.environ.get("DATABUCK_SPARK_SDK_JAR_SHA256", JAR_SHA256)
+        temporary = None
+        try:
+            jar.parent.mkdir(parents=True, exist_ok=True)
+            print(f"databuck: downloading Spark JAR to {jar}", file=sys.stderr)
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=f".{JAR_NAME}.", suffix=".tmp",
+                dir=jar.parent, delete=False
+            ) as output:
+                temporary = Path(output.name)
+                digest = hashlib.sha256()
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    total = None
+                    if getattr(response, "headers", None) is not None:
+                        total = response.headers.get("Content-Length")
+                    total = int(total) if total else None
+                    downloaded = 0
+                    next_report = 50 * 1024 * 1024
+                    while chunk := response.read(1024 * 1024):
+                        output.write(chunk)
+                        digest.update(chunk)
+                        downloaded += len(chunk)
+                        if downloaded >= next_report:
+                            progress = f" / {total / (1024 * 1024):.1f} MiB" if total else ""
+                            print(
+                                f"databuck: downloaded {downloaded / (1024 * 1024):.1f} MiB{progress}",
+                                file=sys.stderr,
+                            )
+                            next_report += 50 * 1024 * 1024
+            if not zipfile.is_zipfile(temporary):
+                raise ValueError("The downloaded file is not a valid JAR archive")
+            if digest.hexdigest().lower() != expected_sha256.lower():
+                raise ValueError("The downloaded JAR failed SHA-256 verification")
+            os.replace(temporary, jar)
+            print(f"databuck: JAR ready at {jar}", file=sys.stderr)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            raise RuntimeError(
+                f"Could not download the DataBuck Spark SDK JAR from {url} "
+                f"to {jar}: {exc}. Set DATABUCK_SPARK_SDK_JAR to an existing "
+                "local JAR path or DATABUCK_SPARK_SDK_JAR_URL to a reachable URL. "
+                "If the JAR changes, also set DATABUCK_SPARK_SDK_JAR_SHA256."
+            ) from exc
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return str(jar.resolve())
 
     # ------------------------------------------------------------------
@@ -1232,6 +1303,21 @@ class DataBuck:
         from .agentic_rules import discover_rules
 
         return discover_rules(df, context)
+
+    @staticmethod
+    def discover_and_export(df, path, *, context: dict | None = None):
+        """Export profiling rules, adding BuckGPT rules when context is given."""
+        if df is None:
+            raise ValueError("df cannot be None")
+        if context is not None and not isinstance(context, dict):
+            raise TypeError("context must be a dictionary or None")
+
+        rules = DataBuck.discover_rules(df)
+        context_rules = DataBuck.discover(df, context) if context is not None else None
+        output_path = rules.to_lake(
+            path, df=df, context=context, context_rules=context_rules
+        )
+        return output_path
 
     # ------------------------------------------------------------------
     # COUNT
