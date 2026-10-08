@@ -79,8 +79,10 @@ audited, passed BuckGPT rules in the required
 `SELECT * FROM {{DATAFRAME}} WHERE <invalid-row condition>` shape can be
 exported; an unsupported query fails the export.
 `business_context` is optional when `context` contains a Gemini key and any
-reference PDFs. Paths in `pdf_paths` must point to existing `.pdf` files;
-convert `.docx` documents to PDF before using them here.
+reference documents. The existing `pdf_paths` field accepts `.pdf` and `.docx`
+files. PDF files are uploaded to Gemini; text from Word documents is extracted
+locally and included in the generation and audit prompts. Images or scanned
+pages in a Word document are not read.
 
 To export only automatic profiling rules, omit `context`:
 

@@ -3,7 +3,9 @@
 import json
 import os
 import re
+import zipfile
 from typing import Any
+from xml.etree import ElementTree
 
 
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -32,8 +34,13 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
     if rule_count < 1 or rule_count > 50:
         raise ValueError("context['rule_count'] must be between 1 and 50")
 
-    pdf_paths = _get_pdf_paths(context)
-    prompt = _build_prompt(df, context, rule_count, pdf_paths)
+    reference_paths = _get_reference_paths(context)
+    pdf_paths = [path for path in reference_paths if path.lower().endswith(".pdf")]
+    word_documents = [
+        {"name": os.path.basename(path), "text": _read_docx_text(path)}
+        for path in reference_paths if path.lower().endswith(".docx")
+    ]
+    prompt = _build_prompt(df, context, rule_count, reference_paths, word_documents)
     response_text, audit_response_text = _generate_and_audit_with_gemini(
         api_key=api_key,
         model=context.get("gemini_model", DEFAULT_MODEL),
@@ -65,7 +72,8 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
 
 
 def _build_prompt(
-    df: Any, context: dict, rule_count: int, pdf_paths: list[str]
+    df: Any, context: dict, rule_count: int, reference_paths: list[str],
+    word_documents: list[dict[str, str]]
 ) -> str:
     schema = [
         {
@@ -87,22 +95,22 @@ def _build_prompt(
             "include_failed_rules",
         }
     }
-    document_names = [os.path.basename(path) for path in pdf_paths]
+    document_names = [os.path.basename(path) for path in reference_paths]
 
     return """You are a data-quality rule generator.
 Generate up to {rule_count} accurate data-quality SQL rules for the DataFrame
 described below. It is acceptable to return fewer rules when the supplied
 reference context does not define enough unambiguous controls.
-The attached PDF documents are approved reference context. Use them when they
-support a rule. If a rule is based on a PDF, identify the relevant policy text
-in reference_context.
+The attached PDFs and Word document text are approved reference context. Use
+them when they support a rule. If a rule is based on a document, identify the
+relevant policy text in reference_context.
 
 Return only a JSON array. Every item must contain exactly these string fields:
 name, description, reference_context, sql.
 
 Reference requirements:
 - Every rule must be supported by exactly one explicit policy or business
-  statement from the supplied context or attached PDFs.
+  statement from the supplied context or reference documents.
 - reference_context must quote that exact supporting statement. Do not
   paraphrase, combine statements, or claim a reference that does not exist.
 - Do not infer additional business meaning, ID patterns, allowed values,
@@ -136,14 +144,18 @@ DataFrame schema:
 Business context:
 {context}
 
-Attached PDF documents:
+Reference document names:
 {documents}
+
+Word document text:
+{word_documents}
 """.format(
         rule_count=rule_count,
         placeholder=DATAFRAME_PLACEHOLDER,
         schema=json.dumps(schema, indent=2),
         context=json.dumps(safe_context, default=str, indent=2),
         documents=json.dumps(document_names),
+        word_documents=json.dumps(word_documents, ensure_ascii=False),
     )
 
 
@@ -276,25 +288,45 @@ def _parse_audit_results(audit_response_text: str, rule_count: int) -> dict[int,
     return audits_by_index
 
 
-def _get_pdf_paths(context: dict) -> list[str]:
-    pdf_paths = context.get("pdf_paths", [])
-    if pdf_paths is None:
+def _get_reference_paths(context: dict) -> list[str]:
+    reference_paths = context.get("pdf_paths", [])
+    if reference_paths is None:
         return []
-    if not isinstance(pdf_paths, (list, tuple)) or not all(
-        isinstance(path, str) and path.strip() for path in pdf_paths
+    if not isinstance(reference_paths, (list, tuple)) or not all(
+        isinstance(path, str) and path.strip() for path in reference_paths
     ):
         raise TypeError("context['pdf_paths'] must be a list of non-empty file paths")
 
     resolved_paths = []
-    for path in pdf_paths:
-        if not path.lower().endswith(".pdf"):
-            raise ValueError("Only PDF files are supported in context['pdf_paths']")
+    for path in reference_paths:
+        if not path.lower().endswith((".pdf", ".docx")):
+            raise ValueError("Only PDF and DOCX files are supported in context['pdf_paths']")
         if not os.path.isfile(path):
             raise FileNotFoundError(
-                "PDF was not found on the notebook driver: {}".format(path)
+                "Reference document was not found on the notebook driver: {}".format(path)
             )
         resolved_paths.append(path)
     return resolved_paths
+
+
+def _read_docx_text(path: str) -> str:
+    """Read paragraph and table text from a Word document without extra dependencies."""
+    paragraph_tag = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
+    text_tag = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
+    try:
+        with zipfile.ZipFile(path) as archive:
+            document = ElementTree.fromstring(archive.read("word/document.xml"))
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile,
+            ElementTree.ParseError) as exc:
+        raise ValueError("Could not read Word document: {}".format(path)) from exc
+    paragraphs = [
+        "".join(node.text or "" for node in paragraph.iter(text_tag)).strip()
+        for paragraph in document.iter(paragraph_tag)
+    ]
+    result = "\n".join(paragraph for paragraph in paragraphs if paragraph)
+    if not result:
+        raise ValueError("Word document contains no readable text: {}".format(path))
+    return result
 
 
 def _parse_rules(response_text: str) -> list[dict[str, str]]:
