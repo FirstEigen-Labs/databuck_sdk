@@ -103,7 +103,7 @@ json_path = DataBuck.discover(
     df,
     "/Volumes/catalog/schema/volume/expectations.json",
     context={
-        "gemini_api_key": dbutils.secrets.get(scope="databuck", key="gemini-api-key"),
+        "gemini_api_key": "YOUR_GEMINI_API_KEY",
         "pdf_paths": [
             "/Volumes/catalog/schema/volume/customer_policy.pdf",
             "/Volumes/catalog/schema/volume/data_contract.docx",
@@ -222,10 +222,10 @@ yaml_path = DataBuck.discover(
     "/Volumes/catalog/schema/volume/telco_expectations.yaml",
     table_name="telco_customer_subscription",
     context={
-        "gemini_api_key": dbutils.secrets.get(scope="databuck", key="gemini-api-key"),
+        "gemini_api_key": "YOUR_GEMINI_API_KEY",
         "pdf_paths": [
-            "/Volumes/catalog/schema/volume/telco_policy.pdf",
-            "/Volumes/catalog/schema/volume/telco_contract.docx",
+            "/Volumes/catalog/schema/volume/customer_policy.pdf",
+            "/Volumes/catalog/schema/volume/data_contract.docx",
         ],
     },
 )
