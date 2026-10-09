@@ -1,8 +1,9 @@
 # databuck-spark-sdk
 
 Python wrapper for the DataBuck Spark SDK. It discovers data-quality rules from
-an existing Spark DataFrame and exports expectations that Databricks Lakeflow
-Declarative Pipelines can execute before downstream data is published.
+an existing Spark DataFrame or a registered Spark table and exports expectations
+that Databricks Lakeflow Declarative Pipelines can execute before downstream
+data is published.
 
 ## Install
 
@@ -90,30 +91,48 @@ print(DataBuck.count(df))
 
 ## Discover and export rules for Databricks
 
-Run discovery in a Databricks notebook or Spark job against the DataFrame already
-in your pipeline. Pass PDF and DOCX policy files for context-aware BuckGPT rules.
+Run discovery in a Databricks notebook or Spark job against an existing DataFrame,
+or pass a Spark table name and the SDK will read it into a DataFrame internally.
+Pass PDF and DOCX policy files for context-aware BuckGPT rules.
 The SDK exports generated rules as JSON (`.json`) or YAML (`.yaml` / `.yml`).
 A Lakeflow Declarative Pipeline then loads and executes those rules as
-expectations. The example below uses JSON; the YAML workflow appears below.
+expectations. Choose one of the two JSON inputs below; both use the same
+discovery and export flow. The YAML workflow appears below.
 
 ```python
 from databuck import DataBuck
 
+context = {
+    "gemini_api_key": "YOUR_GEMINI_API_KEY",
+    "pdf_paths": [
+        "/Volumes/catalog/schema/volume/customer_policy.pdf",
+        "/Volumes/catalog/schema/volume/data_contract.docx",
+    ],
+}
+
+# Option 1: use a DataFrame already available in your pipeline.
 json_path = DataBuck.discover(
-    df,
-    "/Volumes/catalog/schema/volume/expectations.json",
-    context={
-        "gemini_api_key": "YOUR_GEMINI_API_KEY",
-        "pdf_paths": [
-            "/Volumes/catalog/schema/volume/customer_policy.pdf",
-            "/Volumes/catalog/schema/volume/data_contract.docx",
-        ],
-    },
+    df, "/Volumes/catalog/schema/volume/expectations.json", context=context
 )
 print(json_path)
 ```
 
-Replace the example Volume paths with files available in your workspace.
+Or pass a registered Spark table name. The SDK calls `spark.read.table(...)`
+internally, then passes that DataFrame through the same discovery and export:
+
+```python
+json_path = DataBuck.discover(
+    "catalog.schema.telco_customer_subscription",
+    "/Volumes/catalog/schema/volume/expectations.json",
+    context=context,
+)
+print(json_path)
+```
+
+Replace the example Volume paths and table name with files and a table available
+in your workspace. The table-name option uses the notebook's Spark session and
+requires read access to the registered table; it does not take separate database
+connection details. Passing an existing DataFrame avoids reading the table again.
 
 The single call runs profile discovery and context-aware BuckGPT discovery,
 then writes both sets of row expectations into one file. The output extension
@@ -162,12 +181,12 @@ from pyspark import pipelines as dp
 with open("/Volumes/catalog/schema/volume/expectations.json", encoding="utf-8") as stream:
     expectations = json.load(stream)
 
-@dp.table
+@dp.materialized_view(name="telco_customers_checked")
 @dp.expect_all(expectations["warn"])
 @dp.expect_all_or_drop(expectations["drop"])
 @dp.expect_all_or_fail(expectations["fail"])
 def customers_checked():
-    return spark.read.table("catalog.schema.customers_source")
+    return spark.read.table("catalog.schema.telco_customer_subscription")
 ```
 
 ### What the pipeline results look like
@@ -213,29 +232,52 @@ The example shows the file shape; the actual actions are chosen by Gemini.
 
 ## Export flat YAML expectations
 
-Pass a `.yaml` or `.yml` output file and a `table_name` to write the same
-exportable rules as a flat table-scoped YAML document:
+Pass a `.yaml` or `.yml` output file to write the same exportable rules as a
+flat YAML document. As with JSON, pass either an existing DataFrame or a table
+name. Choose one of these calls:
 
 ```python
+from databuck import DataBuck
+
+context = {
+    "gemini_api_key": "YOUR_GEMINI_API_KEY",
+    "pdf_paths": [
+        "/Volumes/catalog/schema/volume/customer_policy.pdf",
+        "/Volumes/catalog/schema/volume/data_contract.docx",
+    ],
+}
+
+# Option 1: use a DataFrame already available in your pipeline.
 yaml_path = DataBuck.discover(
     df,
     "/Volumes/catalog/schema/volume/telco_expectations.yaml",
-    table_name="telco_customer_subscription",
-    context={
-        "gemini_api_key": "YOUR_GEMINI_API_KEY",
-        "pdf_paths": [
-            "/Volumes/catalog/schema/volume/customer_policy.pdf",
-            "/Volumes/catalog/schema/volume/data_contract.docx",
-        ],
-    },
+    context=context,
 )
+print(yaml_path)
 ```
+
+Or pass a registered Spark table name. The SDK reads it into a DataFrame
+internally before discovering and exporting the rules:
+
+```python
+yaml_path = DataBuck.discover(
+    "catalog.schema.telco_customer_subscription",
+    "/Volumes/catalog/schema/volume/telco_expectations.yaml",
+    context=context,
+)
+print(yaml_path)
+```
+
+No separate `table_name=` argument is needed. When you pass a table name, YAML
+includes a `table:` field. When you pass a DataFrame, YAML contains
+`expectations:` without a `table:` field because the original table name is
+not reliably available from a DataFrame.
 
 For example, the generated file has this shape (the names and SQL depend on the
 discovered rules):
 
 ```yaml
-table: telco_customer_subscription
+table: catalog.schema.telco_customer_subscription
 
 expectations:
   not_null_subscriber_id: "`subscriber_id` IS NOT NULL"
@@ -244,8 +286,7 @@ expectations:
 
 YAML combines automatic and audited BuckGPT rules under `expectations` without
 `warn`, `drop`, or `fail` groups. It does not call the action classifier. Use
-JSON when the pipeline needs those action groups. A Spark DataFrame does not
-reliably retain its source table name, so `table_name` is required for YAML.
+JSON when the pipeline needs those action groups.
 Omit `context` to write only automatically discovered rules.
 
 To run the flat YAML expectations in a Lakeflow Declarative Pipeline, add
@@ -259,11 +300,16 @@ from pyspark import pipelines as dp
 with open("/Volumes/catalog/schema/volume/telco_expectations.yaml", encoding="utf-8") as stream:
     rules_doc = yaml.safe_load(stream)
 
-@dp.table(name="telco_customers_checked")
+source_table = rules_doc.get("table") or "catalog.schema.telco_customer_subscription"
+
+@dp.materialized_view(name="telco_customers_checked")
 @dp.expect_all(rules_doc["expectations"])
 def telco_customers_checked():
-    return spark.read.table(f"catalog.schema.{rules_doc['table']}")
+    return spark.read.table(source_table)
 ```
+
+If you discovered from a DataFrame, set the fallback `source_table` to the
+table or transformation that produces the same columns and rows.
 
 In this example, YAML rules are monitored with `dp.expect_all`: invalid rows
 remain in the output and their failures are recorded. Use the action-grouped

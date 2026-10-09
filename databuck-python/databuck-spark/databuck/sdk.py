@@ -1306,14 +1306,24 @@ class DataBuck:
     @staticmethod
     def discover(df, path=None, *, context: dict | None = None,
                  table_name: str | None = None):
-        """Discover and export rules to JSON/YAML, or return legacy context rules.
+        """Discover rules from a DataFrame or Spark table and export JSON/YAML.
 
         A file path selects combined profiling and BuckGPT export. Passing a
         context dictionary as the second argument retains the older API that
-        returns only BuckGPT rules.
+        returns only BuckGPT rules. A string first argument is read as a Spark
+        table using the active session.
         """
         if df is None:
             raise ValueError("df cannot be None")
+        source_table = None
+        if isinstance(df, str):
+            source_table = df.strip()
+            if not source_table:
+                raise ValueError("table name cannot be empty")
+            from pyspark.sql import SparkSession
+
+            spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+            df = spark.read.table(source_table)
         if isinstance(path, dict):
             if context is not None or table_name is not None:
                 raise TypeError("Pass context as the second argument or with an output path")
@@ -1322,10 +1332,8 @@ class DataBuck:
             return DataBuck._discover_context_rules(df, context)
         if context is not None and not isinstance(context, dict):
             raise TypeError("context must be a dictionary or None")
-
-        from .lake_rules import _export_format, _validated_table_name
-        if _export_format(path) == "yaml":
-            _validated_table_name(table_name)
+        if source_table is not None and table_name is None:
+            table_name = source_table
 
         rules = DataBuck.discover_rules(df)
         print("\nAuto-discovered DataBuck rules ({}):".format(len(rules)))

@@ -84,12 +84,10 @@ class DiscoveredRules(list):
 
         JSON groups rules by action. Pass ``df`` and ``context`` to have Gemini
         select those actions; without context, every JSON rule uses ``warn``.
-        YAML writes a flat ``table`` / ``expectations`` document, requiring
-        ``table_name`` and omitting action classification.
+        YAML writes flat ``expectations``, optionally with ``table`` when a
+        source table name is known, and omits action classification.
         """
         export_format = _export_format(path_where_needs_to_export)
-        if export_format == "yaml":
-            _validated_table_name(table_name)
 
         expectations = {}
         for rule in self:
@@ -350,7 +348,7 @@ def _export_format(path_where_needs_to_export):
 
 def _validated_table_name(table_name):
     if not isinstance(table_name, str) or not table_name.strip():
-        raise ValueError("table_name is required when exporting YAML expectations")
+        raise ValueError("table_name must be a non-empty string when provided")
     return table_name.strip()
 
 
@@ -362,7 +360,8 @@ def write_expectations(expectations, path_where_needs_to_export, *, table_name=N
     export_format = _export_format(path_where_needs_to_export)
     output = Path(path_where_needs_to_export)
     if export_format == "yaml":
-        table_name = _validated_table_name(table_name)
+        if table_name is not None:
+            table_name = _validated_table_name(table_name)
         if not expectations:
             raise ValueError("No Databricks expectations are available to export")
     else:
@@ -373,7 +372,9 @@ def write_expectations(expectations, path_where_needs_to_export, *, table_name=N
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as stream:
         if export_format == "yaml":
-            stream.write("table: {}\n\nexpectations:\n".format(_yaml_scalar(table_name)))
+            if table_name is not None:
+                stream.write("table: {}\n\n".format(_yaml_scalar(table_name)))
+            stream.write("expectations:\n")
             for name, expression in expectations.items():
                 stream.write("  {}: {}\n".format(
                     _yaml_scalar(name), json.dumps(expression, ensure_ascii=False)
