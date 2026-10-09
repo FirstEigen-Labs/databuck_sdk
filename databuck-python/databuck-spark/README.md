@@ -32,11 +32,44 @@ the published JAR's SHA-256 hash. If the JAR content changes, publish a new
 Python package version with its new hash, or set
 `DATABUCK_SPARK_SDK_JAR_SHA256` to the expected hash.
 
-For a Databricks notebook, install the Python distribution as a library and
-make the JAR available on the cluster. If the package directory is read-only,
-configure `DATABUCK_SPARK_SDK_JAR` to a writable driver path before importing.
+### Databricks notebook setup
 
-## Usage
+Run this once in the notebook to install the Python package:
+
+```python
+%pip install databuck-spark-sdk
+```
+
+Restart the Python session if Databricks prompts you to. In the next cell,
+set a writable Unity Catalog Volume **file path** before importing `databuck`:
+
+```python
+import os
+
+os.environ["DATABUCK_SPARK_SDK_JAR"] = (
+    "/Volumes/catalog/schema/volume/databuck-spark-sdk.jar"
+)
+
+from databuck import DataBuck  # Downloads the JAR to that path on first import.
+
+print(DataBuck.jar_path())
+```
+
+Use the full filename ending in `.jar`, not just the Volume directory. Importing
+`databuck` downloads or reuses the JAR at that path. Setting the variable after
+the import is too late to choose the initial download location. A Volume keeps
+the JAR available beyond the current notebook driver session.
+
+Before calling `DataBuck.discover(...)`, attach the downloaded JAR to the
+**compute that runs discovery**: in Databricks, open **Compute** > select that
+compute > **Libraries** > **Install New**, select the Volume as the library
+source, choose the JAR path printed above, and install it. If the compute is
+already running, restart it or reattach the notebook so Spark loads the new
+library. Then read your Spark DataFrame and run the discovery example below.
+The Python import downloads the file; it does not attach the JAR to compute.
+See [Databricks compute-scoped library instructions](https://docs.databricks.com/aws/en/libraries/cluster-libraries).
+
+## Local PySpark usage
 
 ```python
 from pyspark.sql import SparkSession
