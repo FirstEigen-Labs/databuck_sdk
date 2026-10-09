@@ -1305,12 +1305,17 @@ class DataBuck:
         return discover_rules(df, context)
 
     @staticmethod
-    def discover_and_export(df, path, *, context: dict | None = None):
+    def discover_and_export(df, path, *, context: dict | None = None,
+                            table_name: str | None = None):
         """Export profiling rules, adding BuckGPT rules when context is given."""
         if df is None:
             raise ValueError("df cannot be None")
         if context is not None and not isinstance(context, dict):
             raise TypeError("context must be a dictionary or None")
+
+        from .lake_rules import _export_format, _validated_table_name
+        if _export_format(path) == "yaml":
+            _validated_table_name(table_name)
 
         rules = DataBuck.discover_rules(df)
         print("\nAuto-discovered DataBuck rules ({}):".format(len(rules)))
@@ -1318,7 +1323,8 @@ class DataBuck:
             print("Rule {}: {}".format(index, rule))
         context_rules = DataBuck.discover(df, context) if context is not None else None
         output_path = rules.to_lake(
-            path, df=df, context=context, context_rules=context_rules
+            path, df=df, context=context, context_rules=context_rules,
+            table_name=table_name
         )
         return output_path
 

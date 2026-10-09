@@ -1,4 +1,4 @@
-"""Export profile-discovered row rules as Databricks expectation JSON."""
+"""Export profile-discovered row rules as Databricks expectations."""
 
 import json
 import math
@@ -15,6 +15,8 @@ _EXPORTABLE_TYPES = {
 _NAME_PART = re.compile(r"[^a-z0-9_]+")
 _PROFILE_PATTERN = re.compile(r"val:(.*?)per:\s*\(?[0-9]+(?:\.[0-9]+)?%\)?")
 _ACTIONS = ("warn", "drop", "fail")
+_YAML_SUFFIXES = {".yaml", ".yml"}
+_YAML_PLAIN_SCALAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
 
 class DiscoveredRules(list):
@@ -77,13 +79,18 @@ class DiscoveredRules(list):
         return prepared
 
     def to_lake(self, path_where_needs_to_export, *, df=None, context=None,
-                context_rules=None):
-        """Export expectations grouped by action.
+                context_rules=None, table_name=None):
+        """Export expectations as action-grouped JSON or table-scoped YAML.
 
-        Pass ``df`` and ``context`` to have Gemini select actions using the
-        discovered rules and a small sample of the DataFrame. Business context
-        is optional. Without context, every rule defaults to ``warn``.
+        JSON groups rules by action. Pass ``df`` and ``context`` to have Gemini
+        select those actions; without context, every JSON rule uses ``warn``.
+        YAML writes a flat ``table`` / ``expectations`` document, requiring
+        ``table_name`` and omitting action classification.
         """
+        export_format = _export_format(path_where_needs_to_export)
+        if export_format == "yaml":
+            _validated_table_name(table_name)
+
         expectations = {}
         for rule in self:
             rule_type = rule.get("ruleType")
@@ -154,6 +161,11 @@ class DiscoveredRules(list):
 
         if not expectations:
             raise ValueError("No Databricks expectations are available to export")
+        if export_format == "yaml":
+            self.action_decisions = {}
+            return write_expectations(
+                expectations, path_where_needs_to_export, table_name=table_name
+            )
         if context is None:
             decisions = {name: {"action": "warn", "reason": "No action classification requested."}
                          for name in expectations}
@@ -328,16 +340,45 @@ def _add(expectations, prefix, column, expression):
     expectations[name] = expression
 
 
-def write_expectations(expectations, path_where_needs_to_export):
-    if not isinstance(path_where_needs_to_export, (str, os.PathLike)) or not os.fspath(path_where_needs_to_export):
+def _export_format(path_where_needs_to_export):
+    if (not isinstance(path_where_needs_to_export, (str, os.PathLike))
+            or not os.fspath(path_where_needs_to_export)):
         raise ValueError("An output file or directory path is required")
-    if not any(expectations.get(action) for action in _ACTIONS):
-        raise ValueError("No Databricks expectations are available to export")
+    suffix = Path(path_where_needs_to_export).suffix.lower()
+    return "yaml" if suffix in _YAML_SUFFIXES else "json"
+
+
+def _validated_table_name(table_name):
+    if not isinstance(table_name, str) or not table_name.strip():
+        raise ValueError("table_name is required when exporting YAML expectations")
+    return table_name.strip()
+
+
+def _yaml_scalar(value):
+    return value if _YAML_PLAIN_SCALAR.fullmatch(value) else json.dumps(value, ensure_ascii=False)
+
+
+def write_expectations(expectations, path_where_needs_to_export, *, table_name=None):
+    export_format = _export_format(path_where_needs_to_export)
     output = Path(path_where_needs_to_export)
-    if output.suffix.lower() != ".json":
+    if export_format == "yaml":
+        table_name = _validated_table_name(table_name)
+        if not expectations:
+            raise ValueError("No Databricks expectations are available to export")
+    else:
+        if not any(expectations.get(action) for action in _ACTIONS):
+            raise ValueError("No Databricks expectations are available to export")
+    if export_format == "json" and output.suffix.lower() != ".json":
         output /= "databuck_expectations.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as stream:
-        json.dump(expectations, stream, indent=2, ensure_ascii=False)
-        stream.write("\n")
+        if export_format == "yaml":
+            stream.write("table: {}\n\nexpectations:\n".format(_yaml_scalar(table_name)))
+            for name, expression in expectations.items():
+                stream.write("  {}: {}\n".format(
+                    _yaml_scalar(name), json.dumps(expression, ensure_ascii=False)
+                ))
+        else:
+            json.dump(expectations, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
     return str(output)

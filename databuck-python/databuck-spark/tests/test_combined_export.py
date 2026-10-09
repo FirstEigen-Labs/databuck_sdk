@@ -66,6 +66,58 @@ class CombinedExportTests(unittest.TestCase):
                 "fail": {"BuckGPT_Rule_001": "NOT COALESCE((account_id IS NULL), FALSE)"},
             })
 
+    def test_yaml_export_combines_auto_and_buckgpt_rules(self):
+        profiling_rules = DiscoveredRules([{
+            "ruleType": "Null Check",
+            "columnName": "subscriber_id",
+            "parameters": {"nullThreshold": 0},
+        }])
+        buckgpt_rules = [{
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE status = 'INVALID'",
+            "audit_status": "PASSED",
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "expectations.yaml"
+            with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
+                 patch.object(DataBuck, "discover", return_value=buckgpt_rules), \
+                 patch("databuck.lake_rules._classify_actions_with_llm") as classify:
+                result = DataBuck.discover_and_export(
+                    object(), str(destination), context={"business_context": "test"},
+                    table_name="telco_customer_subscription"
+                )
+            classify.assert_not_called()
+            self.assertEqual(result, str(destination))
+            self.assertEqual(destination.read_text(encoding="utf-8"),
+                             'table: telco_customer_subscription\n\n'
+                             'expectations:\n'
+                             '  not_null_subscriber_id: "`subscriber_id` IS NOT NULL"\n'
+                             '  BuckGPT_Rule_001: "NOT COALESCE((status = \'INVALID\'), FALSE)"\n')
+
+    def test_yml_export_requires_table_name_before_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "expectations.yml"
+            with patch.object(DataBuck, "discover_rules") as discover:
+                with self.assertRaisesRegex(ValueError, "table_name is required"):
+                    DataBuck.discover_and_export(object(), str(destination))
+            discover.assert_not_called()
+            self.assertFalse(destination.exists())
+
+    def test_yml_export_supports_qualified_table_name(self):
+        profiling_rules = DiscoveredRules([{
+            "ruleType": "Null Check",
+            "columnName": "subscriber_id",
+            "parameters": {"nullThreshold": 0},
+        }])
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "expectations.YML"
+            with patch.object(DataBuck, "discover_rules", return_value=profiling_rules):
+                DataBuck.discover_and_export(
+                    object(), str(destination), table_name="catalog.schema.telco"
+                )
+            self.assertTrue(destination.read_text(encoding="utf-8").startswith(
+                "table: catalog.schema.telco\n\nexpectations:\n"
+            ))
+
     def test_context_query_null_is_a_passing_row(self):
         expression = _context_rule_expectation({
             "sql": "SELECT * FROM {{DATAFRAME}} WHERE status = 'INVALID'",
