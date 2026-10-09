@@ -24,9 +24,9 @@ class CombinedExportTests(unittest.TestCase):
             destination = Path(directory) / "expectations.json"
             output = io.StringIO()
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
-                 patch.object(DataBuck, "discover") as discover_context:
+                 patch.object(DataBuck, "_discover_context_rules") as discover_context:
                 with redirect_stdout(output):
-                    DataBuck.discover_and_export(object(), str(destination))
+                    DataBuck.discover(object(), str(destination))
             discover_context.assert_not_called()
             self.assertIn("Auto-discovered DataBuck rules (1)", output.getvalue())
             self.assertIn("subscriber_id", output.getvalue())
@@ -54,9 +54,9 @@ class CombinedExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "expectations.json"
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
-                 patch.object(DataBuck, "discover", return_value=buckgpt_rules), \
+                 patch.object(DataBuck, "_discover_context_rules", return_value=buckgpt_rules), \
                  patch("databuck.lake_rules._classify_actions_with_llm", return_value=decisions):
-                result = DataBuck.discover_and_export(
+                result = DataBuck.discover(
                     object(), str(destination), context={"business_context": "test"}
                 )
             self.assertEqual(result, str(destination))
@@ -79,9 +79,9 @@ class CombinedExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "expectations.yaml"
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
-                 patch.object(DataBuck, "discover", return_value=buckgpt_rules), \
+                 patch.object(DataBuck, "_discover_context_rules", return_value=buckgpt_rules), \
                  patch("databuck.lake_rules._classify_actions_with_llm") as classify:
-                result = DataBuck.discover_and_export(
+                result = DataBuck.discover(
                     object(), str(destination), context={"business_context": "test"},
                     table_name="telco_customer_subscription"
                 )
@@ -98,7 +98,7 @@ class CombinedExportTests(unittest.TestCase):
             destination = Path(directory) / "expectations.yml"
             with patch.object(DataBuck, "discover_rules") as discover:
                 with self.assertRaisesRegex(ValueError, "table_name is required"):
-                    DataBuck.discover_and_export(object(), str(destination))
+                    DataBuck.discover(object(), str(destination))
             discover.assert_not_called()
             self.assertFalse(destination.exists())
 
@@ -111,12 +111,20 @@ class CombinedExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "expectations.YML"
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules):
-                DataBuck.discover_and_export(
+                DataBuck.discover(
                     object(), str(destination), table_name="catalog.schema.telco"
                 )
             self.assertTrue(destination.read_text(encoding="utf-8").startswith(
                 "table: catalog.schema.telco\n\nexpectations:\n"
             ))
+
+    def test_legacy_discover_with_context_dictionary_still_returns_rules(self):
+        context = {"gemini_api_key": "test-key"}
+        expected = [{"name": "Required account"}]
+        with patch.object(DataBuck, "_discover_context_rules", return_value=expected) as generate:
+            self.assertIs(DataBuck.discover(object(), context), expected)
+            self.assertIs(DataBuck.discover(object(), context=context), expected)
+        self.assertEqual(generate.call_count, 2)
 
     def test_context_query_null_is_a_passing_row(self):
         expression = _context_rule_expectation({

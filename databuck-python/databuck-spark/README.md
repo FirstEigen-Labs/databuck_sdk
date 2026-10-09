@@ -66,7 +66,7 @@ expectations. The example below uses JSON; the YAML workflow appears below.
 ```python
 from databuck import DataBuck
 
-json_path = DataBuck.discover_and_export(
+json_path = DataBuck.discover(
     df,
     "/Volumes/catalog/schema/volume/expectations.json",
     context={
@@ -101,7 +101,7 @@ scanned pages in a Word document are not read.
 To export only automatic profiling rules, omit `context`:
 
 ```python
-json_path = DataBuck.discover_and_export(
+json_path = DataBuck.discover(
     df, "/Volumes/catalog/schema/volume/expectations.json"
 )
 ```
@@ -137,6 +137,33 @@ def customers_checked():
     return spark.read.table("catalog.schema.customers_source")
 ```
 
+### What the pipeline results look like
+
+`DataBuck.discover(df, output_path, ...)` prints the rules and returns the path to the rules
+file. The row results appear **after the Lakeflow Declarative Pipeline runs**,
+in the validated table's **Expectations** view. For example, one telco demo run
+showed:
+
+| Pipeline result | Records |
+| --- | ---: |
+| Written | 58 (58%) |
+| Dropped | 42 (42%) |
+
+| Expectation | Action shown in Databricks | Failed records |
+| --- | --- | ---: |
+| `BuckGPT_Rule_006` | ALLOW | 60 |
+| `BuckGPT_Rule_007` | DROP | 40 |
+| `BuckGPT_Rule_009` | DROP | 20 |
+| `valid_length_network_type` | DROP | 4 |
+| `valid_pattern_network_type` | DROP | 4 |
+
+`ALLOW` corresponds to `dp.expect_all`: the violation is recorded without
+dropping the row. `DROP` corresponds to `dp.expect_all_or_drop`: invalid rows
+are excluded from the validated output. A `FAIL` expectation stops the pipeline
+update when violated. A row can fail more than one rule, so the per-rule failed
+record counts do not add up to the dropped-row total. These numbers are from one
+demo update; actual results depend on the source data and exported rules.
+
 The pipeline must read a DataFrame with the columns used by the exported
 expectations. Regenerate the rules file when the source schema or business
 policy changes, then refresh the pipeline.
@@ -157,7 +184,7 @@ Pass a `.yaml` or `.yml` output file and a `table_name` to write the same
 exportable rules as a flat table-scoped YAML document:
 
 ```python
-yaml_path = DataBuck.discover_and_export(
+yaml_path = DataBuck.discover(
     df,
     "/Volumes/catalog/schema/volume/telco_expectations.yaml",
     table_name="telco_customer_subscription",
@@ -209,9 +236,10 @@ In this example, YAML rules are monitored with `dp.expect_all`: invalid rows
 remain in the output and their failures are recorded. Use the action-grouped
 JSON format if rules must drop rows or fail the pipeline update.
 
-`DataBuck.discover_rules(df)` and
-`DataBuck.discover(df, context)` are still available separately. The new
-`DataBuck.discover_and_export(...)` call combines them.
+`DataBuck.discover_rules(df)` still returns automatic profiling rules without
+exporting. For compatibility, `DataBuck.discover(df, context_dict)` still
+returns BuckGPT rules without exporting. Pass an output file path as the second
+argument to `DataBuck.discover(...)` to combine discovery and export.
 
 In JSON, each action dictionary maps expectation names to Spark SQL pass conditions,
 such as `{"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"}`. Null, pattern,

@@ -1290,8 +1290,7 @@ class DataBuck:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def discover(df, context: dict):
-
+    def _discover_context_rules(df, context: dict):
         if df is None:
             raise ValueError("df cannot be None")
 
@@ -1305,11 +1304,22 @@ class DataBuck:
         return discover_rules(df, context)
 
     @staticmethod
-    def discover_and_export(df, path, *, context: dict | None = None,
-                            table_name: str | None = None):
-        """Export profiling rules, adding BuckGPT rules when context is given."""
+    def discover(df, path=None, *, context: dict | None = None,
+                 table_name: str | None = None):
+        """Discover and export rules to JSON/YAML, or return legacy context rules.
+
+        A file path selects combined profiling and BuckGPT export. Passing a
+        context dictionary as the second argument retains the older API that
+        returns only BuckGPT rules.
+        """
         if df is None:
             raise ValueError("df cannot be None")
+        if isinstance(path, dict):
+            if context is not None or table_name is not None:
+                raise TypeError("Pass context as the second argument or with an output path")
+            return DataBuck._discover_context_rules(df, path)
+        if path is None and context is not None and table_name is None:
+            return DataBuck._discover_context_rules(df, context)
         if context is not None and not isinstance(context, dict):
             raise TypeError("context must be a dictionary or None")
 
@@ -1321,7 +1331,10 @@ class DataBuck:
         print("\nAuto-discovered DataBuck rules ({}):".format(len(rules)))
         for index, rule in enumerate(rules, start=1):
             print("Rule {}: {}".format(index, rule))
-        context_rules = DataBuck.discover(df, context) if context is not None else None
+        context_rules = (
+            DataBuck._discover_context_rules(df, context)
+            if context is not None else None
+        )
         output_path = rules.to_lake(
             path, df=df, context=context, context_rules=context_rules,
             table_name=table_name
