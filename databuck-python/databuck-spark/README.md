@@ -160,9 +160,10 @@ json_path = DataBuck.discover(
 
 Without context, BuckGPT is not called. In JSON, all exported rules use `warn`.
 
-The JSON contains three dictionaries: `warn`, `drop`, and `fail`. Gemini
-classifies every exported expectation using the rule expression, DataFrame
-schema, and up to five sample rows. The PDF and DOCX files support BuckGPT rule
+The JSON contains three action dictionaries: `warn`, `drop`, and `fail`. For JSON
+exports with `context`, Gemini classifies exported expectations using the rule
+expression, DataFrame schema, and up to five sample rows. The PDF and DOCX
+files support BuckGPT rule
 generation and audit; they are not passed again to action classification. The
 schema and sample are sent to Gemini. If its response is incomplete or invalid,
 export fails instead of assigning a destructive action.
@@ -232,9 +233,8 @@ The example shows the file shape; the actual actions are chosen by Gemini.
 
 ## Export flat YAML expectations
 
-Pass a `.yaml` or `.yml` output file to write the same exportable rules as a
-flat YAML document. As with JSON, pass either an existing DataFrame or a table
-name. Choose one of these calls:
+Pass a `.yaml` or `.yml` output file to write a flat YAML document. Pass either
+an existing DataFrame or a table name. Choose one of these calls:
 
 ```python
 from databuck import DataBuck

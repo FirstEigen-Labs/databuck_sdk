@@ -1339,12 +1339,15 @@ class DataBuck:
         print("\nAuto-discovered DataBuck rules ({}):".format(len(rules)))
         for index, rule in enumerate(rules, start=1):
             print("Rule {}: {}".format(index, rule))
+        from .lake_rules import _export_format
+
+        export_df = rules.prepare_for_lake(df) if _export_format(path) == "json" else df
         context_rules = (
             DataBuck._discover_context_rules(df, context)
             if context is not None else None
         )
         output_path = rules.to_lake(
-            path, df=df, context=context, context_rules=context_rules,
+            path, df=export_df, context=context, context_rules=context_rules,
             table_name=table_name
         )
         return output_path

@@ -28,12 +28,12 @@ class DiscoveredRules(list):
         Apply the exported expectations to this returned DataFrame, not the
         original one. Pass ``group_by`` when statistics are calculated per group.
         """
-        from pyspark.sql import functions as F
-        from pyspark.sql import Window
-
         specs = _value_anomaly_specs(self)
         if not specs:
             return df
+
+        from pyspark.sql import functions as F
+        from pyspark.sql import Window
 
         groups = [group_by] if isinstance(group_by, str) else list(group_by or ())
         for column in groups:
@@ -176,7 +176,19 @@ class DiscoveredRules(list):
         for name, expression in expectations.items():
             grouped[decisions[name]["action"]][name] = expression
         self.action_decisions = decisions
-        return write_expectations(grouped, path_where_needs_to_export)
+        preparation = None
+        if getattr(self, "_prepared_value_anomaly", ()):
+            preparation = {"value_anomaly": [
+                {
+                    "column": column,
+                    "mean_column": _anomaly_stat_columns(column)[0],
+                    "stddev_column": _anomaly_stat_columns(column)[1],
+                }
+                for column, _ in self._prepared_value_anomaly
+            ]}
+        return write_expectations(
+            grouped, path_where_needs_to_export, preparation=preparation
+        )
 
 
 def _context_rule_expectation(rule, name):
@@ -356,7 +368,8 @@ def _yaml_scalar(value):
     return value if _YAML_PLAIN_SCALAR.fullmatch(value) else json.dumps(value, ensure_ascii=False)
 
 
-def write_expectations(expectations, path_where_needs_to_export, *, table_name=None):
+def write_expectations(expectations, path_where_needs_to_export, *,
+                       table_name=None, preparation=None):
     export_format = _export_format(path_where_needs_to_export)
     output = Path(path_where_needs_to_export)
     if export_format == "yaml":
@@ -380,6 +393,9 @@ def write_expectations(expectations, path_where_needs_to_export, *, table_name=N
                     _yaml_scalar(name), json.dumps(expression, ensure_ascii=False)
                 ))
         else:
-            json.dump(expectations, stream, indent=2, ensure_ascii=False)
+            document = dict(expectations)
+            if preparation:
+                document["preparation"] = preparation
+            json.dump(document, stream, indent=2, ensure_ascii=False)
             stream.write("\n")
     return str(output)

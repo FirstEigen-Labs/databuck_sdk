@@ -11,7 +11,9 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
 
 from databuck import DataBuck
-from databuck.lake_rules import DiscoveredRules, _context_rule_expectation
+from databuck.lake_rules import (
+    DiscoveredRules, _context_rule_expectation, _value_anomaly_specs,
+)
 
 
 class CombinedExportTests(unittest.TestCase):
@@ -88,6 +90,59 @@ class CombinedExportTests(unittest.TestCase):
                 "drop": {},
                 "fail": {},
             })
+
+    def test_value_anomaly_exports_current_dataset_preparation(self):
+        rule = {
+            "ruleType": "Value Anomaly Check",
+            "columnName": "monthly_charge_usd",
+            "threshold": 3.0,
+            "expression": "",
+            "parameters": {"columns": ["`monthly_charge_usd`", "`data_usage_gb`"]},
+        }
+        profiling_rules = DiscoveredRules([rule])
+        source_df = object()
+        prepared_df = object()
+
+        def prepare(actual_df):
+            self.assertIs(actual_df, source_df)
+            profiling_rules._prepared_value_anomaly = _value_anomaly_specs(profiling_rules)
+            return prepared_df
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "expectations.json"
+            with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
+                 patch.object(profiling_rules, "prepare_for_lake", side_effect=prepare) as prepare_mock, \
+                 patch.object(DataBuck, "_discover_context_rules", return_value=[]), \
+                 patch("databuck.lake_rules._classify_actions_with_llm", return_value={
+                     "valid_value_monthly_charge_usd": {
+                         "action": "drop", "reason": "Outlier"
+                     },
+                     "valid_value_data_usage_gb": {
+                         "action": "drop", "reason": "Outlier"
+                     },
+                 }) as classify:
+                DataBuck.discover(source_df, str(destination), context={"gemini_api_key": "test"})
+
+            prepare_mock.assert_called_once_with(source_df)
+            self.assertIs(classify.call_args.args[1], prepared_df)
+            exported = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(set(exported["drop"]), {
+                "valid_value_monthly_charge_usd", "valid_value_data_usage_gb"
+            })
+            self.assertIn("<= 3 * `__databuck_va_stddev_monthly_charge_usd`",
+                          exported["drop"]["valid_value_monthly_charge_usd"])
+            self.assertEqual(exported["preparation"]["value_anomaly"], [
+                {
+                    "column": "monthly_charge_usd",
+                    "mean_column": "__databuck_va_mean_monthly_charge_usd",
+                    "stddev_column": "__databuck_va_stddev_monthly_charge_usd",
+                },
+                {
+                    "column": "data_usage_gb",
+                    "mean_column": "__databuck_va_mean_data_usage_gb",
+                    "stddev_column": "__databuck_va_stddev_data_usage_gb",
+                },
+            ])
 
     def test_single_call_exports_both_rule_sources(self):
         profiling_rules = DiscoveredRules([{
