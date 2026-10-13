@@ -91,7 +91,7 @@ class CombinedExportTests(unittest.TestCase):
                 "fail": {},
             })
 
-    def test_value_anomaly_exports_current_dataset_preparation(self):
+    def test_value_anomaly_embeds_discovered_baseline(self):
         rule = {
             "ruleType": "Value Anomaly Check",
             "columnName": "monthly_charge_usd",
@@ -106,6 +106,10 @@ class CombinedExportTests(unittest.TestCase):
         def prepare(actual_df):
             self.assertIs(actual_df, source_df)
             profiling_rules._prepared_value_anomaly = _value_anomaly_specs(profiling_rules)
+            profiling_rules._value_anomaly_baselines = {
+                "monthly_charge_usd": (50.0, 5.0),
+                "data_usage_gb": (12.0, 2.0),
+            }
             return prepared_df
 
         with tempfile.TemporaryDirectory() as directory:
@@ -129,20 +133,9 @@ class CombinedExportTests(unittest.TestCase):
             self.assertEqual(set(exported["drop"]), {
                 "valid_value_monthly_charge_usd", "valid_value_data_usage_gb"
             })
-            self.assertIn("<= 3 * `__databuck_va_stddev_monthly_charge_usd`",
+            self.assertIn("ABS(CAST(`monthly_charge_usd` AS DOUBLE) - 50) <= 3 * 5",
                           exported["drop"]["valid_value_monthly_charge_usd"])
-            self.assertEqual(exported["preparation"]["value_anomaly"], [
-                {
-                    "column": "monthly_charge_usd",
-                    "mean_column": "__databuck_va_mean_monthly_charge_usd",
-                    "stddev_column": "__databuck_va_stddev_monthly_charge_usd",
-                },
-                {
-                    "column": "data_usage_gb",
-                    "mean_column": "__databuck_va_mean_data_usage_gb",
-                    "stddev_column": "__databuck_va_stddev_data_usage_gb",
-                },
-            ])
+            self.assertNotIn("preparation", exported)
 
     def test_single_call_exports_both_rule_sources(self):
         profiling_rules = DiscoveredRules([{

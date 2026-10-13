@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+from itertools import combinations
 from pathlib import Path
 
 
@@ -11,9 +12,9 @@ _EXPORTABLE_TYPES = {
     "Null Check": "not_null",
     "Default Pattern Check": "valid_pattern",
     "Length Check": "valid_length",
+    "Date Rule": "valid_date",
 }
 _NAME_PART = re.compile(r"[^a-z0-9_]+")
-_PROFILE_PATTERN = re.compile(r"val:(.*?)per:\s*\(?[0-9]+(?:\.[0-9]+)?%\)?")
 _ACTIONS = ("warn", "drop", "fail")
 _YAML_SUFFIXES = {".yaml", ".yml"}
 _YAML_PLAIN_SCALAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
@@ -23,60 +24,63 @@ class DiscoveredRules(list):
     """SDK rules that can write row-level Databricks expectations."""
 
     def prepare_for_lake(self, df, group_by=None):
-        """Add current-run mean and standard deviation columns for value anomalies.
-
-        Apply the exported expectations to this returned DataFrame, not the
-        original one. Pass ``group_by`` when statistics are calculated per group.
-        """
+        """Capture value anomaly baselines for self-contained expectations."""
         specs = _value_anomaly_specs(self)
-        if not specs:
+        date_pairs = _date_pairs(self)
+        if not specs and not date_pairs:
             return df
 
         from pyspark.sql import functions as F
-        from pyspark.sql import Window
 
-        groups = [group_by] if isinstance(group_by, str) else list(group_by or ())
-        for column in groups:
-            if column.replace("`", "").strip() not in df.columns:
-                raise ValueError("Group column {!r} is missing from the DataFrame".format(column))
+        if specs and group_by:
+            raise ValueError("Grouped value anomaly baselines cannot be embedded in one expectation")
 
-        statistic_names = []
         for column, _ in specs:
             if column not in df.columns:
                 raise ValueError("Value anomaly column {!r} is missing from the DataFrame".format(column))
-            statistic_names.extend(_anomaly_stat_columns(column))
-        if len(statistic_names) != len(set(statistic_names)) or any(
-            name in df.columns for name in statistic_names
-        ):
-            raise ValueError("Value anomaly statistic columns would conflict with DataFrame columns")
 
-        if groups:
-            window = Window.partitionBy(*[F.col(_quoted_column(column)) for column in groups])
-            prepared = df
-            for column, _ in specs:
-                mean_name, std_name = _anomaly_stat_columns(column)
-                numeric = F.col(_quoted_column(column)).cast("double")
-                prepared = prepared.withColumn(mean_name, F.avg(numeric).over(window))
-                prepared = prepared.withColumn(std_name, F.stddev_samp(numeric).over(window))
-        else:
+        baselines = {}
+        if specs:
             aggregates = []
             for column, _ in specs:
                 mean_name, std_name = _anomaly_stat_columns(column)
                 numeric = F.col(_quoted_column(column)).cast("double")
                 aggregates.extend((F.avg(numeric).alias(mean_name),
                                    F.stddev_samp(numeric).alias(std_name)))
-            prepared = df.crossJoin(F.broadcast(df.agg(*aggregates)))
-
-        for column, _ in specs:
-            _, std_name = _anomaly_stat_columns(column)
-            std = F.col(_quoted_column(std_name))
-            prepared = prepared.withColumn(
-                std_name,
-                F.when(std.isNull() | F.isnan(std) | (std == 0), F.lit(0.5)).otherwise(std),
-            )
+            stats = df.agg(*aggregates).first()
+            for column, _ in specs:
+                mean_name, std_name = _anomaly_stat_columns(column)
+                mean = stats[mean_name]
+                std = stats[std_name]
+                if mean is None or not math.isfinite(float(mean)):
+                    raise ValueError("Cannot export a value anomaly baseline for {!r}".format(column))
+                std = float(std) if std is not None else 0.5
+                if not math.isfinite(std) or std == 0:
+                    std = 0.5
+                baselines[column] = (float(mean), std)
 
         self._prepared_value_anomaly = specs
-        return prepared
+        self._value_anomaly_baselines = baselines
+        date_bounds = {}
+        for first, first_format, second, second_format in date_pairs:
+            first_date = _parsed_date_expression(first, first_format)
+            second_date = _parsed_date_expression(second, second_format)
+            difference = "DATEDIFF(CAST({} AS DATE), CAST({} AS DATE))".format(
+                first_date, second_date)
+            differences = df.selectExpr("{} AS __databuck_date_difference".format(difference))
+            limits = differences.agg(
+                F.expr("PERCENTILE_APPROX(__databuck_date_difference, 0.99)").alias("upper"),
+                F.expr("PERCENTILE_APPROX(__databuck_date_difference, 0.05)").alias("lower"),
+            ).first()
+            if limits["upper"] is None or limits["lower"] is None:
+                continue
+            upper, lower = float(limits["upper"]), float(limits["lower"])
+            spread = upper - lower
+            maximum = 0.0 if upper < 0 and lower < 0 else upper + 0.25 * spread
+            minimum = 0.0 if upper > 0 and lower > 0 else lower - 0.25 * spread
+            date_bounds[(first, second)] = (minimum, maximum)
+        self._date_pair_bounds = date_bounds
+        return df
 
     def to_lake(self, path_where_needs_to_export, *, df=None, context=None,
                 context_rules=None, table_name=None):
@@ -90,6 +94,16 @@ class DiscoveredRules(list):
         export_format = _export_format(path_where_needs_to_export)
 
         expectations = {}
+        value_specs = _value_anomaly_specs(self)
+        if value_specs != getattr(self, "_prepared_value_anomaly", ()):
+            raise ValueError("Call rules.prepare_for_lake(df) before exporting value anomaly rules")
+        if value_specs and set(getattr(self, "_value_anomaly_baselines", {})) != {
+            column for column, _ in value_specs
+        }:
+            raise ValueError("Value anomaly baselines are missing; call rules.prepare_for_lake(df)")
+        date_pairs = _date_pairs(self)
+        if date_pairs and not hasattr(self, "_date_pair_bounds"):
+            raise ValueError("Call rules.prepare_for_lake(df) before exporting date consistency rules")
         for rule in self:
             rule_type = rule.get("ruleType")
             column = rule.get("columnName")
@@ -108,20 +122,17 @@ class DiscoveredRules(list):
                      "{} IS NOT NULL".format(_quoted_column(column)))
 
             elif rule_type == "Default Pattern Check":
-                definition = parameters.get("topPattern") or rule.get("expression") or ""
-                patterns = _PROFILE_PATTERN.findall(str(definition))
+                definition = parameters.get("topPattern")
+                patterns = _default_patterns(definition)
                 if not patterns:
                     continue
-                alternatives = []
-                for pattern in patterns:
-                    regex = "".join("[A-Z]" if char == "A" else
-                                    "[0-9]" if char == "#" else re.escape(char)
-                                    for char in pattern)
-                    alternatives.append("(?:^{}$)".format(regex))
                 identifier = _quoted_column(column)
+                generated = ("REGEXP_REPLACE(REGEXP_REPLACE(TRIM(CAST({} AS STRING)), "
+                             "'[a-zA-Z]', 'A'), '[0-9]', '#')").format(identifier)
+                allowed = ", ".join(_sql_regex_literal(pattern) for pattern in patterns)
                 _add(expectations, "valid_pattern", column,
-                     "{} IS NULL OR CAST({} AS STRING) RLIKE {}".format(
-                         identifier, identifier, _sql_regex_literal("|".join(alternatives))))
+                     "{} IS NULL OR TRIM(CAST({} AS STRING)) = '' OR {} IN ({})".format(
+                         identifier, identifier, generated, allowed))
 
             elif rule_type == "Length Check":
                 length_columns = parameters.get("lengthColumns")
@@ -144,14 +155,32 @@ class DiscoveredRules(list):
                          "{} IS NULL OR LENGTH(CAST({} AS STRING)) IN ({})".format(
                              identifier, identifier, formatted))
 
-        for column, threshold in getattr(self, "_prepared_value_anomaly", ()):
+            elif rule_type == "Date Rule":
+                identifier = _quoted_column(column)
+                parsed = _parsed_date_expression(column, parameters.get("dateFormat"))
+                _add(expectations, "valid_date", column,
+                     "{} IS NULL OR {} IS NOT NULL".format(identifier, parsed))
+
+        for first, first_format, second, second_format in date_pairs:
+            bounds = self._date_pair_bounds.get((first, second))
+            if bounds is None:
+                continue
+            first_date = _parsed_date_expression(first, first_format)
+            second_date = _parsed_date_expression(second, second_format)
+            difference = "DATEDIFF(CAST({} AS DATE), CAST({} AS DATE))".format(
+                first_date, second_date)
+            _add(expectations, "consistent_date", "{}_{}".format(first, second),
+                 "{} IS NULL OR {} IS NULL OR {} BETWEEN {} AND {}".format(
+                     first_date, second_date, difference,
+                     format(bounds[0], ".17g"), format(bounds[1], ".17g")))
+
+        for column, threshold in value_specs:
             identifier = _quoted_column(column)
-            mean_name, std_name = _anomaly_stat_columns(column)
-            mean = _quoted_column(mean_name)
-            std = _quoted_column(std_name)
+            mean, std = self._value_anomaly_baselines[column]
             _add(expectations, "valid_value", column,
-                 "{} IS NULL OR ({} IS NOT NULL AND ABS(CAST({} AS DOUBLE) - {}) <= {} * {})".format(
-                     identifier, mean, identifier, mean, format(threshold, ".15g"), std))
+                 "{} IS NULL OR ABS(CAST({} AS DOUBLE) - {}) <= {} * {}".format(
+                     identifier, identifier, format(mean, ".17g"),
+                     format(threshold, ".15g"), format(std, ".17g")))
 
         for index, rule in enumerate(context_rules or (), start=1):
             name = "BuckGPT_Rule_{:03d}".format(index)
@@ -162,7 +191,7 @@ class DiscoveredRules(list):
         if export_format == "yaml":
             self.action_decisions = {}
             return write_expectations(
-                expectations, path_where_needs_to_export, table_name=table_name
+                expectations, path_where_needs_to_export, table_name=table_name,
             )
         if context is None:
             decisions = {name: {"action": "warn", "reason": "No action classification requested."}
@@ -176,18 +205,8 @@ class DiscoveredRules(list):
         for name, expression in expectations.items():
             grouped[decisions[name]["action"]][name] = expression
         self.action_decisions = decisions
-        preparation = None
-        if getattr(self, "_prepared_value_anomaly", ()):
-            preparation = {"value_anomaly": [
-                {
-                    "column": column,
-                    "mean_column": _anomaly_stat_columns(column)[0],
-                    "stddev_column": _anomaly_stat_columns(column)[1],
-                }
-                for column, _ in self._prepared_value_anomaly
-            ]}
         return write_expectations(
-            grouped, path_where_needs_to_export, preparation=preparation
+            grouped, path_where_needs_to_export
         )
 
 
@@ -323,6 +342,28 @@ def _value_anomaly_specs(rules):
     return tuple(specs.items())
 
 
+def _date_pairs(rules):
+    dates = {}
+    for rule in rules:
+        if rule.get("ruleType") != "Date Rule":
+            continue
+        column = rule.get("columnName")
+        if isinstance(column, str):
+            column = column.replace("`", "").strip()
+            if column:
+                dates[column] = (rule.get("parameters") or {}).get("dateFormat")
+    return tuple((first, dates[first], second, dates[second])
+                 for first, second in combinations(sorted(dates), 2))
+
+
+def _parsed_date_expression(column, date_format):
+    identifier = _quoted_column(column)
+    if isinstance(date_format, str) and date_format.strip():
+        return "TRY_TO_TIMESTAMP(CAST({} AS STRING), '{}')".format(
+            identifier, date_format.strip().replace("'", "''"))
+    return "TRY_CAST({} AS TIMESTAMP)".format(identifier)
+
+
 def _anomaly_stat_columns(column):
     suffix = _NAME_PART.sub("_", column.lower()).strip("_")
     return "__databuck_va_mean_{}".format(suffix), "__databuck_va_stddev_{}".format(suffix)
@@ -338,6 +379,23 @@ def _quoted_column(column):
 def _sql_regex_literal(regex):
     # Ordinary Databricks SQL strings need doubled backslashes for Java regex.
     return "'{}'".format(regex.replace("\\", "\\\\").replace("'", "''"))
+
+
+def _default_patterns(definition):
+    """Read the frequency tagged or plain patterns accepted by the Spark check."""
+    if not isinstance(definition, str) or not definition.strip():
+        return []
+    if "val:" in definition and "per:" in definition:
+        candidates = (part.split("per:", 1)[0] for part in definition.split("val:")[1:]
+                      if "per:" in part)
+    else:
+        candidates = definition.split(",")
+    patterns = []
+    for candidate in candidates:
+        pattern = candidate.strip().replace("[", "").replace("]", "").strip()
+        if pattern and pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
 
 
 def _add(expectations, prefix, column, expression):
@@ -368,8 +426,7 @@ def _yaml_scalar(value):
     return value if _YAML_PLAIN_SCALAR.fullmatch(value) else json.dumps(value, ensure_ascii=False)
 
 
-def write_expectations(expectations, path_where_needs_to_export, *,
-                       table_name=None, preparation=None):
+def write_expectations(expectations, path_where_needs_to_export, *, table_name=None):
     export_format = _export_format(path_where_needs_to_export)
     output = Path(path_where_needs_to_export)
     if export_format == "yaml":
@@ -393,9 +450,6 @@ def write_expectations(expectations, path_where_needs_to_export, *,
                     _yaml_scalar(name), json.dumps(expression, ensure_ascii=False)
                 ))
         else:
-            document = dict(expectations)
-            if preparation:
-                document["preparation"] = preparation
-            json.dump(document, stream, indent=2, ensure_ascii=False)
+            json.dump(expectations, stream, indent=2, ensure_ascii=False)
             stream.write("\n")
     return str(output)
