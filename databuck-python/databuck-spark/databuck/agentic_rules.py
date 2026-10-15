@@ -10,6 +10,17 @@ from xml.etree import ElementTree
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 DATAFRAME_PLACEHOLDER = "{{DATAFRAME}}"
+_CONTROL_CONTEXT_KEYS = {
+    "gemini_api_key", "gemini_model", "rule_count", "pdf_paths",
+    "include_failed_rules",
+}
+
+
+def has_rule_reference_context(context: dict) -> bool:
+    """Whether context supplies statements from which BuckGPT can build rules."""
+    return bool(context.get("pdf_paths")) or any(
+        value for key, value in context.items() if key not in _CONTROL_CONTEXT_KEYS
+    )
 
 
 def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
@@ -87,13 +98,7 @@ def _build_prompt(
     safe_context = {
         key: value
         for key, value in context.items()
-        if key not in {
-            "gemini_api_key",
-            "gemini_model",
-            "rule_count",
-            "pdf_paths",
-            "include_failed_rules",
-        }
+        if key not in _CONTROL_CONTEXT_KEYS
     }
     document_names = [os.path.basename(path) for path in reference_paths]
 

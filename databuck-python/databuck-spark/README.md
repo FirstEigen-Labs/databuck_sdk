@@ -159,6 +159,11 @@ json_path = DataBuck.discover(
 ```
 
 Without context, BuckGPT is not called. In JSON, all exported rules use `warn`.
+If `context` contains only Gemini settings, JSON export skips BuckGPT rule
+generation and uses Gemini only to classify the automatic rules. To generate
+BuckGPT rules, include an explicit business statement (for example in
+`business_context`) or a PDF/DOCX policy path. An API key alone does not
+describe a business rule.
 
 The JSON contains three action dictionaries: `warn`, `drop`, and `fail`. For JSON
 exports with `context`, Gemini classifies exported expectations using the rule

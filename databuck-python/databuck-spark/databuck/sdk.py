@@ -2,6 +2,7 @@ import hashlib
 import os
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -1335,14 +1336,20 @@ class DataBuck:
         if source_table is not None and table_name is None:
             table_name = source_table
 
+        discovery_started = time.perf_counter()
         rules = DataBuck.discover_rules(df)
+        discovery_seconds = time.perf_counter() - discovery_started
+        print("Auto-discovery time: {:.2f} seconds".format(discovery_seconds))
         print("\nAuto-discovered DataBuck rules ({}):".format(len(rules)))
         for index, rule in enumerate(rules, start=1):
             print("Rule {}: {}".format(index, rule))
         export_df = rules.prepare_for_lake(df)
+        if context is not None:
+            from .agentic_rules import has_rule_reference_context
+
         context_rules = (
             DataBuck._discover_context_rules(df, context)
-            if context is not None else None
+            if context is not None and has_rule_reference_context(context) else None
         )
         output_path = rules.to_lake(
             path, df=export_df, context=context, context_rules=context_rules,

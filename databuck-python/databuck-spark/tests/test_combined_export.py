@@ -79,10 +79,12 @@ class CombinedExportTests(unittest.TestCase):
             destination = Path(directory) / "expectations.json"
             output = io.StringIO()
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
-                 patch.object(DataBuck, "_discover_context_rules") as discover_context:
+                 patch.object(DataBuck, "_discover_context_rules") as discover_context, \
+                 patch("databuck.sdk.time.perf_counter", side_effect=[10.0, 12.5]):
                 with redirect_stdout(output):
                     DataBuck.discover(object(), str(destination))
             discover_context.assert_not_called()
+            self.assertIn("Auto-discovery time: 2.50 seconds", output.getvalue())
             self.assertIn("Auto-discovered DataBuck rules (1)", output.getvalue())
             self.assertIn("subscriber_id", output.getvalue())
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {
@@ -90,6 +92,26 @@ class CombinedExportTests(unittest.TestCase):
                 "drop": {},
                 "fail": {},
             })
+
+    def test_api_key_only_classifies_profiling_rules_without_buckgpt_generation(self):
+        profiling_rules = DiscoveredRules([{
+            "ruleType": "Null Check",
+            "columnName": "subscriber_id",
+            "parameters": {"nullThreshold": 0},
+        }])
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "expectations.json"
+            with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
+                 patch.object(DataBuck, "_discover_context_rules") as discover_context, \
+                 patch("databuck.lake_rules._classify_actions_with_llm", return_value={
+                     "not_null_subscriber_id": {"action": "warn", "reason": "Monitor ID"}
+                 }) as classify:
+                DataBuck.discover(object(), str(destination),
+                                  context={"gemini_api_key": "test-key"})
+            discover_context.assert_not_called()
+            classify.assert_called_once()
+            self.assertEqual(json.loads(destination.read_text(encoding="utf-8"))["warn"],
+                             {"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"})
 
     def test_value_anomaly_embeds_discovered_baseline(self):
         rule = {
