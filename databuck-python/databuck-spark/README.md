@@ -1,4 +1,4 @@
-# databuck
+# databuck-spark-sdk
 
 Python wrapper for the DataBuck Spark SDK. It discovers data-quality rules from
 an existing Spark DataFrame or a registered Spark table and exports expectations
@@ -8,7 +8,7 @@ data is published.
 ## Install
 
 ```bash
-python -m pip install databuck
+python -m pip install databuck-spark-sdk
 python -c "import databuck"
 ```
 
@@ -38,7 +38,7 @@ Python package version with its new hash, or set
 Run this once in the notebook to install the Python package:
 
 ```python
-%pip install databuck
+%pip install databuck-spark-sdk
 ```
 
 Restart the Python session if Databricks prompts you to. In the next cell,
