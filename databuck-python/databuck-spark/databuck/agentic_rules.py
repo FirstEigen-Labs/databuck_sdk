@@ -124,11 +124,6 @@ Reference requirements:
   rule requires an explicit format, allowed-value list, or validation condition.
 - A null/empty check is permitted only when the reference explicitly says
   required, present, non-null, non-empty, or mandatory.
-- When one explicit statement defines an intercolumn relationship involving
-  3 to 5 columns in the schema, create one rule that checks the full
-  relationship across all stated columns. Include every involved column in
-  the invalid-row SQL condition; do not split the relationship into weaker
-  pairwise checks. Do not create such a rule without an explicit statement.
 - If a reference is ambiguous or does not define an executable check, omit it.
 
 SQL requirements:
