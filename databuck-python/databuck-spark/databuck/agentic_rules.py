@@ -12,7 +12,7 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 DATAFRAME_PLACEHOLDER = "{{DATAFRAME}}"
 _CONTROL_CONTEXT_KEYS = {
     "gemini_api_key", "gemini_model", "rule_count", "pdf_paths",
-    "include_failed_rules",
+    "include_failed_rules", "domain_name",
 }
 
 
@@ -100,6 +100,11 @@ def _build_prompt(
         for key, value in context.items()
         if key not in _CONTROL_CONTEXT_KEYS
     }
+    domain_name = context.get("domain_name")
+    if domain_name is not None and (
+        not isinstance(domain_name, str) or not domain_name.strip()
+    ):
+        raise ValueError("context['domain_name'] must be a non-empty string")
     document_names = [os.path.basename(path) for path in reference_paths]
 
     return """You are a data-quality rule generator.
@@ -109,6 +114,9 @@ reference context does not define enough unambiguous controls.
 The attached PDFs and Word document text are approved reference context. Use
 them when they support a rule. If a rule is based on a document, identify the
 relevant policy text in reference_context.
+Use the business domain to interpret the terminology and prioritize relevant
+controls. The domain name alone is not a policy statement and cannot justify
+a rule without an explicit supporting statement.
 
 Return only a JSON array. Every item must contain exactly these string fields:
 name, description, reference_context, sql.
@@ -151,6 +159,9 @@ the quoted reference_context states. Omit the rule if they do not match.
 DataFrame schema:
 {schema}
 
+Business domain:
+{domain_name}
+
 Business context:
 {context}
 
@@ -163,6 +174,7 @@ Word document text:
         rule_count=rule_count,
         placeholder=DATAFRAME_PLACEHOLDER,
         schema=json.dumps(schema, indent=2),
+        domain_name=domain_name.strip() if domain_name is not None else "Not provided",
         context=json.dumps(safe_context, default=str, indent=2),
         documents=json.dumps(document_names),
         word_documents=json.dumps(word_documents, ensure_ascii=False),

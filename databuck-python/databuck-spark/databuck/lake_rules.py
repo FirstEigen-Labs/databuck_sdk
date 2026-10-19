@@ -18,6 +18,13 @@ _NAME_PART = re.compile(r"[^a-z0-9_]+")
 _ACTIONS = ("warn", "drop", "fail")
 _YAML_SUFFIXES = {".yaml", ".yml"}
 _YAML_PLAIN_SCALAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+_PROFILE_METADATA_PARAMETERS = {
+    "Null Check": ("nullThreshold",),
+    "Default Pattern Check": ("topPattern",),
+    "Length Check": ("lengthColumns", "allowedLengths"),
+    "Date Rule": ("dateFormat",),
+    "Value Anomaly Check": ("columns",),
+}
 
 
 class DiscoveredRules(list):
@@ -182,6 +189,15 @@ class DiscoveredRules(list):
                      identifier, identifier, format(mean, ".17g"),
                      format(threshold, ".15g"), format(std, ".17g")))
 
+        if isinstance(context, dict) and "domain_name" in context and expectations:
+            if df is None:
+                raise ValueError("A DataFrame is required to select critical profiling rules")
+            selected = _select_critical_profile_expectations(
+                expectations, df, context, _profile_rule_metadata(self)
+            )
+            expectations = {name: expression for name, expression in expectations.items()
+                            if name in selected}
+
         for index, rule in enumerate(context_rules or (), start=1):
             name = "BuckGPT_Rule_{:03d}".format(index)
             expectations[name] = _context_rule_expectation(rule, name)
@@ -229,6 +245,102 @@ def _context_rule_expectation(rule, name):
         raise ValueError("{} has an invalid row condition".format(name))
     # A WHERE clause selects only TRUE. FALSE and NULL both mean the row passes.
     return "NOT COALESCE(({}), FALSE)".format(invalid)
+
+
+def _profile_rule_metadata(rules):
+    metadata = []
+    for rule in rules:
+        rule_type = rule.get("ruleType")
+        if rule_type not in _PROFILE_METADATA_PARAMETERS:
+            continue
+        parameters = rule.get("parameters") or {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        metadata.append({
+            "rule_type": rule_type,
+            "column_name": rule.get("columnName"),
+            "threshold": rule.get("threshold"),
+            "parameters": {
+                key: parameters[key]
+                for key in _PROFILE_METADATA_PARAMETERS[rule_type] if key in parameters
+            },
+        })
+    return metadata
+
+
+def _select_critical_profile_expectations(expectations, df, context, profile_metadata):
+    domain_name = context.get("domain_name")
+    if not isinstance(domain_name, str) or not domain_name.strip():
+        raise ValueError("context['domain_name'] must be a non-empty string")
+    api_key = str(context.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError("Set context['gemini_api_key'] or GEMINI_API_KEY to select critical rules")
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise ImportError("Critical rule selection requires google-genai") from exc
+
+    business_context = {key: value for key, value in context.items()
+                        if key not in {"gemini_api_key", "gemini_model", "pdf_paths",
+                                       "rule_count", "include_failed_rules", "domain_name"}}
+    prompt = """Act as a {domain_name} subject matter expert and a database expert.
+Review the DataBuck auto-discovered profiling expectations below. Select only
+the rules whose failure would materially affect business decisions, regulatory
+or policy compliance, financial correctness, customer outcomes, or the ability
+to use this dataset for its stated business purpose.
+
+Evaluate each rule in the supplied business context. A generic completeness
+check on a technical ID is often low value; do not select it merely because
+the column is named ID or the rule exists. An account, customer, transaction,
+or other key can still be critical when the context shows that missing values
+would break identity, reconciliation, joins, or a required business process.
+Likewise, do not assume every pattern, length, date, or outlier rule is
+critical. Use the schema, discovery metadata, rule expression, and business
+context to judge impact. Do not infer a business requirement from a column
+name alone.
+
+Return only a JSON array of exact expectation names to retain, with no new
+names, SQL changes, or explanation. Return [] if none are defensibly critical.
+
+Business context:
+{context}
+
+DataFrame schema:
+{schema}
+
+Auto-discovery rule metadata (rule type, column, threshold, and applicable
+profiling parameters; no sample records):
+{profile_metadata}
+
+Auto-discovered profiling expectations:
+{expectations}
+""".format(
+        domain_name=domain_name.strip(),
+        context=json.dumps(business_context, default=str, ensure_ascii=False),
+        schema=df.schema.json(),
+        profile_metadata=json.dumps(profile_metadata, default=str, ensure_ascii=False),
+        expectations=json.dumps(expectations, ensure_ascii=False),
+    )
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=context.get("gemini_model", "gemini-2.5-flash"),
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            response_mime_type="application/json",
+        ),
+    )
+    try:
+        names = json.loads((response.text or "").strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError("Gemini returned invalid JSON for critical profiling rules") from exc
+    if (not isinstance(names, list)
+            or any(not isinstance(name, str) or name not in expectations
+                   for name in names) or len(set(names)) != len(names)):
+        raise ValueError("Gemini returned an invalid critical profiling rule selection")
+    return set(names)
 
 
 def _classify_actions_with_llm(expectations, df, context):

@@ -49,6 +49,18 @@ class ReferenceDocumentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Could not read Word document"):
                 _read_docx_text(str(path))
 
+    def test_buckgpt_prompt_includes_domain_without_treating_it_as_policy(self):
+        df = SimpleNamespace(schema=SimpleNamespace(fields=[]))
+        prompt = _build_prompt(
+            df,
+            {"domain_name": "banking", "business_context": "Balances must reconcile"},
+            10, [], [],
+        )
+        self.assertIn("Business domain:\nbanking", prompt)
+        self.assertIn("domain name alone is not a policy statement", prompt)
+        self.assertIn("Balances must reconcile", prompt)
+        self.assertIn("Business domain:\nbanking", _build_audit_prompt(prompt, []))
+
 
 if __name__ == "__main__":
     unittest.main()

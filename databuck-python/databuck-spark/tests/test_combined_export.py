@@ -189,6 +189,67 @@ class CombinedExportTests(unittest.TestCase):
                 "fail": {"BuckGPT_Rule_001": "NOT COALESCE((account_id IS NULL), FALSE)"},
             })
 
+    def test_domain_selection_filters_only_auto_discovered_rules(self):
+        profiling_rules = DiscoveredRules([
+            {"ruleType": "Null Check", "columnName": "technical_id",
+             "parameters": {"nullThreshold": 0}},
+            {"ruleType": "Null Check", "columnName": "account_id",
+             "parameters": {"nullThreshold": 0}},
+        ])
+        buckgpt_rules = [{
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE balance < 0",
+            "audit_status": "PASSED",
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "expectations.json"
+            with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
+                 patch.object(DataBuck, "_discover_context_rules", return_value=buckgpt_rules), \
+                 patch("databuck.lake_rules._select_critical_profile_expectations",
+                       return_value={"not_null_account_id"}) as select, \
+                 patch("databuck.lake_rules._classify_actions_with_llm", return_value={
+                     "not_null_account_id": {"action": "drop", "reason": "Business key"},
+                     "BuckGPT_Rule_001": {"action": "fail", "reason": "Policy"},
+                 }) as classify:
+                DataBuck.discover(object(), str(destination), context={
+                    "gemini_api_key": "test-key", "domain_name": "banking",
+                    "pdf_paths": [], "business_context": "Account records must be linkable",
+                })
+            self.assertEqual(set(select.call_args.args[0]),
+                             {"not_null_technical_id", "not_null_account_id"})
+            self.assertEqual({item["column_name"] for item in select.call_args.args[3]},
+                             {"technical_id", "account_id"})
+            self.assertEqual(set(classify.call_args.args[0]),
+                             {"not_null_account_id", "BuckGPT_Rule_001"})
+            exported = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertNotIn("not_null_technical_id", str(exported))
+            self.assertIn("not_null_account_id", exported["drop"])
+            self.assertIn("BuckGPT_Rule_001", exported["fail"])
+
+    def test_domain_selection_can_leave_only_buckgpt_rules_in_yaml(self):
+        profiling_rules = DiscoveredRules([{
+            "ruleType": "Null Check", "columnName": "technical_id",
+            "parameters": {"nullThreshold": 0},
+        }])
+        buckgpt_rules = [{
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE balance < 0",
+            "audit_status": "PASSED",
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "expectations.yaml"
+            with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
+                 patch.object(DataBuck, "_discover_context_rules", return_value=buckgpt_rules), \
+                 patch("databuck.lake_rules._select_critical_profile_expectations",
+                       return_value=set()), \
+                 patch("databuck.lake_rules._classify_actions_with_llm") as classify:
+                DataBuck.discover(object(), str(destination), context={
+                    "domain_name": "banking", "gemini_api_key": "test-key",
+                    "business_context": "Balances must not be negative",
+                })
+            classify.assert_not_called()
+            output = destination.read_text(encoding="utf-8")
+            self.assertNotIn("not_null_technical_id", output)
+            self.assertIn("BuckGPT_Rule_001", output)
+
     def test_yaml_export_combines_auto_and_buckgpt_rules(self):
         profiling_rules = DiscoveredRules([{
             "ruleType": "Null Check",

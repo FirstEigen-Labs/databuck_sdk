@@ -104,6 +104,7 @@ from databuck import DataBuck
 
 context = {
     "gemini_api_key": "YOUR_GEMINI_API_KEY",
+    "domain_name": "banking",
     "pdf_paths": [
         "/Volumes/catalog/schema/volume/customer_policy.pdf",
         "/Volumes/catalog/schema/volume/data_contract.docx",
@@ -145,6 +146,16 @@ exported; an unsupported query fails the export.
 The call prints the auto-discovered rules and the BuckGPT rules before it
 exports them. Some auto-discovered rules may not be exportable as row-level
 Lakeflow expectations; the export contains only those that can be converted.
+When `domain_name` is supplied, one additional Gemini call reviews the
+exportable auto-discovered profiling rules as a domain and database expert.
+It receives the DataFrame schema and relevant auto-discovery rule metadata,
+without sample records.
+Only profiling rules selected as business critical are exported; BuckGPT rules
+are not filtered by this step. The selection applies to JSON and YAML exports.
+If no critical profiling rule is selected, BuckGPT rules can still be exported.
+The same `domain_name` is included in BuckGPT's generation and audit prompts
+to interpret policy terminology; it does not replace an explicit policy or
+business statement supporting a BuckGPT rule.
 The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
 notebook driver. PDF files are uploaded to Gemini; text from Word documents is
 extracted locally and included in the generation and audit prompts. Images or
