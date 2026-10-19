@@ -1,4 +1,4 @@
-name: Publish databuck-spark-sdk to PyPI
+name: Publish databuck to PyPI
 
 on:
   workflow_dispatch:
