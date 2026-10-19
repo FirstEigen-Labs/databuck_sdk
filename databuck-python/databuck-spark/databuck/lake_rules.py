@@ -192,6 +192,7 @@ class DiscoveredRules(list):
         if isinstance(context, dict) and "domain_name" in context and expectations:
             if df is None:
                 raise ValueError("A DataFrame is required to select critical profiling rules")
+            print("DataBuck: selecting critical auto-discovered rules", flush=True)
             selected = _select_critical_profile_expectations(
                 expectations, df, context, _profile_rule_metadata(self)
             )
@@ -215,6 +216,7 @@ class DiscoveredRules(list):
         else:
             if df is None:
                 raise ValueError("A DataFrame is required to classify rule actions")
+            print("DataBuck: assigning warn/drop/fail actions", flush=True)
             decisions = _classify_actions_with_llm(expectations, df, context)
 
         grouped = {action: {} for action in _ACTIONS}
@@ -324,22 +326,55 @@ Auto-discovered profiling expectations:
         expectations=json.dumps(expectations, ensure_ascii=False),
     )
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=context.get("gemini_model", "gemini-2.5-flash"),
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        temperature=0.0,
+        response_mime_type="application/json",
     )
+    for attempt in range(2):
+        response = client.models.generate_content(
+            model=context.get("gemini_model", "gemini-2.5-flash"),
+            contents=prompt if attempt == 0 else (
+                prompt + "\nYour previous response did not identify an exact subset of the "
+                "candidate expectation names. Return only their exact names as a JSON "
+                "array. Do not rename rules or include explanations."
+            ),
+            config=config,
+        )
+        try:
+            return _parse_critical_profile_selection(response.text or "", expectations)
+        except ValueError as exc:
+            if attempt == 1:
+                raise ValueError(
+                    "Gemini returned an invalid critical profiling rule selection "
+                    "after one retry: {}".format(exc)
+                ) from exc
+
+
+def _parse_critical_profile_selection(response_text, expectations):
     try:
-        names = json.loads((response.text or "").strip())
+        result = json.loads(response_text.strip())
     except json.JSONDecodeError as exc:
-        raise ValueError("Gemini returned invalid JSON for critical profiling rules") from exc
-    if (not isinstance(names, list)
-            or any(not isinstance(name, str) or name not in expectations
-                   for name in names) or len(set(names)) != len(names)):
-        raise ValueError("Gemini returned an invalid critical profiling rule selection")
+        raise ValueError("response is not valid JSON") from exc
+    if isinstance(result, dict):
+        for key in ("selected_rule_names", "selected_rules", "critical_rules",
+                    "selected_expectations", "rules"):
+            if key in result:
+                result = result[key]
+                break
+    if not isinstance(result, list):
+        raise ValueError("response must contain a list of expectation names")
+
+    names = []
+    for item in result:
+        if isinstance(item, dict):
+            item = next((item[key] for key in ("name", "expectation_name",
+                        "rule_name", "expectation") if key in item), None)
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("each selected rule must have a name")
+        names.append(item.strip())
+    unknown = sorted(set(names) - set(expectations))
+    if unknown:
+        raise ValueError("unknown expectation names: {}".format(", ".join(unknown[:3])))
     return set(names)
 
 

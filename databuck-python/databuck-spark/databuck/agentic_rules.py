@@ -199,6 +199,7 @@ def _generate_and_audit_with_gemini(
         for pdf_path in pdf_paths:
             uploaded_files.append(client.files.upload(file=pdf_path))
 
+        print("BuckGPT: generating rules", flush=True)
         response = client.models.generate_content(
             model=model,
             contents=[prompt, *uploaded_files],
@@ -212,6 +213,7 @@ def _generate_and_audit_with_gemini(
         if not candidate_rules:
             return candidate_response_text, "[]"
 
+        print("BuckGPT: auditing rules", flush=True)
         audit_response = client.models.generate_content(
             model=model,
             contents=[_build_audit_prompt(prompt, candidate_rules), *uploaded_files],

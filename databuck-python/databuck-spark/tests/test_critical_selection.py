@@ -56,12 +56,41 @@ class CriticalSelectionTests(unittest.TestCase):
     def test_selection_rejects_unknown_names(self):
         self.client.models.generate_content.return_value.text = '["invented_rule"]'
         with patch.dict(sys.modules, self.modules):
-            with self.assertRaisesRegex(ValueError, "invalid critical profiling rule selection"):
+            with self.assertRaisesRegex(ValueError, "unknown expectation names: invented_rule"):
                 _select_critical_profile_expectations(
                     self.expectations, self.df,
                     {"domain_name": "banking", "gemini_api_key": "test-key"},
                     self.metadata,
                 )
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_selection_accepts_named_objects_without_changing_rules(self):
+        self.client.models.generate_content.return_value.text = (
+            '{"selected_rules":[{"name":"not_null_account_id",'
+            '"reason":"Required for reconciliation"}]}'
+        )
+        with patch.dict(sys.modules, self.modules):
+            selected = _select_critical_profile_expectations(
+                self.expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                self.metadata,
+            )
+        self.assertEqual(selected, {"not_null_account_id"})
+        self.client.models.generate_content.assert_called_once()
+
+    def test_selection_retries_a_malformed_response_once(self):
+        self.client.models.generate_content.side_effect = [
+            SimpleNamespace(text='{"unexpected":"shape"}'),
+            SimpleNamespace(text='["not_null_account_id"]'),
+        ]
+        with patch.dict(sys.modules, self.modules):
+            selected = _select_critical_profile_expectations(
+                self.expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                self.metadata,
+            )
+        self.assertEqual(selected, {"not_null_account_id"})
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
 
     def test_selection_can_return_no_critical_profile_rules(self):
         self.client.models.generate_content.return_value.text = '[]'
