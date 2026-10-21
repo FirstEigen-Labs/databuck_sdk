@@ -192,12 +192,16 @@ class DiscoveredRules(list):
         if isinstance(context, dict) and "domain_name" in context and expectations:
             if df is None:
                 raise ValueError("A DataFrame is required to select critical profiling rules")
-            print("DataBuck: selecting critical auto-discovered rules", flush=True)
+            candidate_count = len(expectations)
+            print("DataBuck: selecting critical auto-discovered rules "
+                  "({} candidates)".format(candidate_count), flush=True)
             selected = _select_critical_profile_expectations(
                 expectations, df, context, _profile_rule_metadata(self, expectations)
             )
             expectations = {name: expression for name, expression in expectations.items()
                             if name in selected}
+            print("DataBuck: selected {} of {} critical auto-discovered rules".format(
+                len(expectations), candidate_count), flush=True)
 
         for index, rule in enumerate(context_rules or (), start=1):
             name = "BuckGPT_Rule_{:03d}".format(index)

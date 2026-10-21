@@ -10,8 +10,10 @@ package is `databuck-spark-sdk`; the Python import is `databuck`.
 %pip install databuck-spark-sdk
 ```
 
-After installation, restart the Python session if Databricks requests it. The
-first import downloads the SDK JAR. Attach that JAR to the compute running
+After installing or upgrading in Databricks, run
+`dbutils.library.restartPython()` before importing `databuck`. Check the
+installed version with `importlib.metadata.version("databuck-spark-sdk")`.
+The first import downloads the SDK JAR. Attach that JAR to the compute running
 discovery before calling `DataBuck.discover(...)`. See the
 [Python SDK setup guide](databuck-python/databuck-spark/README.md#databricks-notebook-setup)
 for the JAR path and compute library steps.

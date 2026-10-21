@@ -41,11 +41,21 @@ Run this once in the notebook to install the Python package:
 %pip install databuck-spark-sdk
 ```
 
-Restart the Python session if Databricks prompts you to. In the next cell,
-set a writable Unity Catalog Volume **file path** before importing `databuck`:
+After installing or upgrading, restart Python in the next cell so the notebook
+loads the new package version:
+
+```python
+dbutils.library.restartPython()
+```
+
+Then verify the version and set a writable Unity Catalog Volume **file path**
+before importing `databuck`:
 
 ```python
 import os
+from importlib.metadata import version
+
+print(version("databuck-spark-sdk"))
 
 os.environ["DATABUCK_SPARK_SDK_JAR"] = (
     "/Volumes/catalog/schema/volume/databuck-spark-sdk.jar"
