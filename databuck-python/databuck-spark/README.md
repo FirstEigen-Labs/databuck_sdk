@@ -161,8 +161,6 @@ The exported JSON and YAML files contain the rule conditions. When
 `domain_name` is supplied, business-critical selection applies to both
 auto-discovered and BuckGPT rules. The notebook prints the retained count for
 each source. This selection has no fixed rule count.
-The number of exportable auto-discovered checks may differ from the raw
-discovery count because a discovered rule can cover several columns.
 The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
 notebook driver. PDF files are uploaded to Gemini; text from Word documents is
 extracted locally and included in the generation and audit prompts. Images or
