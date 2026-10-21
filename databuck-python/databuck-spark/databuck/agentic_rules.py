@@ -23,6 +23,13 @@ def has_rule_reference_context(context: dict) -> bool:
     )
 
 
+def _allowed_rule_sources(context: dict, reference_paths: list[str]) -> set[str]:
+    sources = {os.path.basename(path) for path in reference_paths}
+    if any(value for key, value in context.items() if key not in _CONTROL_CONTEXT_KEYS):
+        sources.add("business_context")
+    return sources
+
+
 def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
     """Generate portable SQL data-quality rules for the supplied DataFrame.
 
@@ -46,9 +53,7 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         raise ValueError("context['rule_count'] must be between 1 and 50")
 
     reference_paths = _get_reference_paths(context)
-    allowed_sources = {os.path.basename(path) for path in reference_paths}
-    if any(value for key, value in context.items() if key not in _CONTROL_CONTEXT_KEYS):
-        allowed_sources.add("business_context")
+    allowed_sources = _allowed_rule_sources(context, reference_paths)
     pdf_paths = [path for path in reference_paths if path.lower().endswith(".pdf")]
     word_documents = [
         {"name": os.path.basename(path), "text": _read_docx_text(path)}
@@ -111,6 +116,7 @@ def _build_prompt(
     ):
         raise ValueError("context['domain_name'] must be a non-empty string")
     document_names = [os.path.basename(path) for path in reference_paths]
+    allowed_sources = sorted(_allowed_rule_sources(context, reference_paths))
 
     return """You are a data-quality rule generator.
 Generate up to {rule_count} accurate data-quality SQL rules for the DataFrame
@@ -123,7 +129,10 @@ Use the business domain to interpret the terminology and prioritize relevant
 controls. The domain name alone is not a policy statement and cannot justify
 a rule without an explicit supporting statement.
 
-Return only a JSON array. Every item must contain exactly these string fields:
+Return a nonempty JSON array when at least one fully supported rule can be
+derived. Do not return [] merely because some documents are irrelevant. Return
+[] only when no supplied statement supports a valid rule. Every item must
+contain exactly these string fields:
 name, description, source_document, reference_context, sql.
 
 Reference requirements:
@@ -133,7 +142,9 @@ Reference requirements:
   paraphrase, combine statements, or claim a reference that does not exist.
 - source_document must be the exact filename from Reference document names
   containing the quoted statement. If the statement instead comes from the
-  Business context block, use "business_context". Do not invent a filename.
+  Business context block, use "business_context" only when that value appears
+  in Allowed source_document values. Never use a full path, URL, section title,
+  an empty value, or an invented filename.
 - Do not infer additional business meaning, ID patterns, allowed values,
   thresholds, column relationships, or statuses that are not explicitly stated.
 - Do not downgrade a "valid" requirement into a null/empty check. A validity
@@ -176,6 +187,9 @@ Business context:
 Reference document names:
 {documents}
 
+Allowed source_document values (copy one exactly for each rule):
+{sources}
+
 Word document text:
 {word_documents}
 """.format(
@@ -185,6 +199,7 @@ Word document text:
         domain_name=domain_name.strip() if domain_name is not None else "Not provided",
         context=json.dumps(safe_context, default=str, indent=2),
         documents=json.dumps(document_names),
+        sources=json.dumps(allowed_sources),
         word_documents=json.dumps(word_documents, ensure_ascii=False),
     )
 
@@ -209,18 +224,40 @@ def _generate_and_audit_with_gemini(
             uploaded_files.append(client.files.upload(file=pdf_path))
 
         print("BuckGPT: generating rules", flush=True)
-        response = client.models.generate_content(
-            model=model,
-            contents=[prompt, *uploaded_files],
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                response_mime_type="application/json",
-            ),
-        )
-        candidate_response_text = (response.text or "").strip()
-        candidate_rules = _parse_rules(candidate_response_text, allowed_sources)
+        candidate_rules = []
+        rejection_reasons = []
+        for attempt in range(2):
+            generation_prompt = prompt
+            if attempt:
+                generation_prompt += (
+                    "\nThe previous response contained no valid rules: {}. "
+                    "Try again. Use only these exact source_document values: {}. "
+                    "Every rule needs a quoted reference_context and SQL beginning "
+                    "SELECT * FROM {} WHERE. Return [] only if no supported rule exists."
+                ).format(", ".join(sorted(set(rejection_reasons))) or "empty response",
+                         json.dumps(sorted(allowed_sources)), DATAFRAME_PLACEHOLDER)
+            response = client.models.generate_content(
+                model=model,
+                contents=[generation_prompt, *uploaded_files],
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                ),
+            )
+            candidate_response_text = (response.text or "").strip()
+            rejection_reasons = []
+            try:
+                candidate_rules = _parse_rules(candidate_response_text, allowed_sources,
+                                               rejection_reasons)
+            except ValueError as exc:
+                rejection_reasons.append(str(exc))
+                candidate_rules = []
+            if candidate_rules:
+                break
         if not candidate_rules:
-            return candidate_response_text, "[]"
+            raise ValueError("Gemini did not return any valid SQL rules after one retry: {}"
+                             .format(", ".join(sorted(set(rejection_reasons)))
+                                     or "no rules were returned"))
 
         print("BuckGPT: auditing rules", flush=True)
         audit_response = client.models.generate_content(
@@ -364,7 +401,8 @@ def _read_docx_text(path: str) -> str:
     return result
 
 
-def _parse_rules(response_text: str, allowed_sources: set[str]) -> list[dict[str, str]]:
+def _parse_rules(response_text: str, allowed_sources: set[str],
+                 rejection_reasons: list[str] | None = None) -> list[dict[str, str]]:
     try:
         raw_rules = json.loads(_strip_markdown_fence(response_text))
     except json.JSONDecodeError as exc:
@@ -372,10 +410,14 @@ def _parse_rules(response_text: str, allowed_sources: set[str]) -> list[dict[str
 
     if not isinstance(raw_rules, list):
         raise ValueError("Gemini must return a JSON array of rules")
+    if not raw_rules and rejection_reasons is not None:
+        rejection_reasons.append("empty rule list")
 
     rules = []
     for raw_rule in raw_rules:
         if not isinstance(raw_rule, dict):
+            if rejection_reasons is not None:
+                rejection_reasons.append("rule is not a JSON object")
             continue
 
         name = str(raw_rule.get("name", "")).strip()
@@ -383,17 +425,25 @@ def _parse_rules(response_text: str, allowed_sources: set[str]) -> list[dict[str
         source_document = str(raw_rule.get("source_document", "")).strip()
         reference_context = str(raw_rule.get("reference_context", "")).strip()
         sql = str(raw_rule.get("sql", "")).strip()
-        if (
-            not name
-            or not description
-            or source_document not in allowed_sources
-            or not reference_context
-            or not re.match(r"^SELECT\b", sql, re.IGNORECASE)
-        ):
+        if not name or not description or not reference_context:
+            if rejection_reasons is not None:
+                rejection_reasons.append("missing name, description, or reference_context")
+            continue
+        if source_document not in allowed_sources:
+            if rejection_reasons is not None:
+                rejection_reasons.append("source_document is not an allowed filename")
+            continue
+        if not re.match(r"^SELECT\b", sql, re.IGNORECASE):
+            if rejection_reasons is not None:
+                rejection_reasons.append("SQL does not begin with SELECT")
             continue
         if DATAFRAME_PLACEHOLDER not in sql:
+            if rejection_reasons is not None:
+                rejection_reasons.append("SQL is missing {{DATAFRAME}}")
             continue
         if re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|DROP|CREATE|ALTER|CALL)\b", sql, re.IGNORECASE):
+            if rejection_reasons is not None:
+                rejection_reasons.append("SQL contains a forbidden statement")
             continue
 
         rules.append(

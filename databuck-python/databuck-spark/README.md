@@ -161,6 +161,9 @@ containing its quoted `Reference context`, or `business_context` when the quote
 comes from the supplied business text. The audited BuckGPT rule dictionary also
 contains `source_document`. The JSON and YAML expectation files contain SQL
 conditions only and do not include source metadata.
+If Gemini omits the source filename or returns an invalid rule shape, BuckGPT
+retries generation once with the allowed filenames and validation feedback.
+If the retry still produces no valid rules, the error states which field failed.
 When `domain_name` is supplied, one additional Gemini call reviews the
 exportable auto-discovered profiling rules as a domain and database expert.
 It receives the DataFrame schema and relevant auto-discovery rule metadata,

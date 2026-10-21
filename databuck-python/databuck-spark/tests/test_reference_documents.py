@@ -2,12 +2,13 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
 
@@ -15,6 +16,7 @@ from databuck.agentic_rules import (
     _build_audit_prompt,
     _build_prompt,
     _get_reference_paths,
+    _generate_and_audit_with_gemini,
     _parse_rules,
     _read_docx_text,
     discover_rules,
@@ -46,6 +48,7 @@ class ReferenceDocumentTests(unittest.TestCase):
             )
             self.assertIn("Account ID is required.", prompt)
             self.assertIn("policy.docx", prompt)
+            self.assertIn('Allowed source_document values (copy one exactly for each rule):\n["policy.docx"]', prompt)
             self.assertIn("Subscriber ID is required.", _build_audit_prompt(prompt, []))
             self.assertIn("named\n  source_document", _build_audit_prompt(prompt, []))
 
@@ -102,6 +105,39 @@ class ReferenceDocumentTests(unittest.TestCase):
             "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt_inv > funded_amnt",
         }
         self.assertEqual(_parse_rules(json.dumps([rule]), {"banking_policy.pdf"}), [])
+
+    def test_generation_retries_when_source_document_is_invalid(self):
+        rule = {
+            "name": "Required account",
+            "description": "Account is required.",
+            "source_document": "policy.pdf",
+            "reference_context": "Account is required.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE account_id IS NULL",
+        }
+        invalid = dict(rule, source_document="/Volumes/policy.pdf")
+        audit = [{"rule_index": 1, "audit_status": "PASSED",
+                  "audit_reason": "Source and SQL match."}]
+        client = Mock()
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text=json.dumps([invalid])),
+            SimpleNamespace(text=json.dumps([rule])),
+            SimpleNamespace(text=json.dumps(audit)),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            response_text, audit_text = _generate_and_audit_with_gemini(
+                "test-key", "test-model", "prompt", [], {"policy.pdf"},
+            )
+        self.assertEqual(json.loads(response_text), [rule])
+        self.assertEqual(json.loads(audit_text), audit)
+        self.assertEqual(client.models.generate_content.call_count, 3)
+        retry_prompt = client.models.generate_content.call_args_list[1].kwargs["contents"][0]
+        self.assertIn("source_document is not an allowed filename", retry_prompt)
+        self.assertIn('["policy.pdf"]', retry_prompt)
 
 
 if __name__ == "__main__":
