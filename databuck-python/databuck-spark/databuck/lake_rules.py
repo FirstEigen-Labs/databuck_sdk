@@ -194,7 +194,8 @@ class DiscoveredRules(list):
                 raise ValueError("A DataFrame is required to select critical profiling rules")
             candidate_count = len(expectations)
             print("DataBuck: selecting critical auto-discovered rules "
-                  "({} candidates)".format(candidate_count), flush=True)
+                  "({} exportable candidates from {} discovered rules)".format(
+                      candidate_count, len(self)), flush=True)
             selected = _select_critical_profile_expectations(
                 expectations, df, context, _profile_rule_metadata(self, expectations)
             )
@@ -203,9 +204,14 @@ class DiscoveredRules(list):
             print("DataBuck: selected {} of {} critical auto-discovered rules".format(
                 len(expectations), candidate_count), flush=True)
 
+        auto_expectation_count = len(expectations)
         for index, rule in enumerate(context_rules or (), start=1):
             name = "BuckGPT_Rule_{:03d}".format(index)
             expectations[name] = _context_rule_expectation(rule, name)
+        if context_rules:
+            print("DataBuck: exporting {} auto-discovered and {} BuckGPT rules "
+                  "({} total)".format(auto_expectation_count, len(context_rules),
+                                      len(expectations)), flush=True)
 
         if not expectations:
             raise ValueError("No Databricks expectations are available to export")
@@ -335,9 +341,16 @@ critical. Use the schema, discovery metadata, rule expression, and business
 context to judge impact. Do not infer a business requirement from a column
 name alone.
 
+Review each distinct SQL check. Retain it only when you can identify a concrete
+business consequence if that exact check fails, supported by the supplied
+business context, schema, and rule metadata. A profiling pattern or length
+learned from observed data is not automatically a business requirement. Do not
+retain all completeness, pattern, or length checks merely because the domain
+is regulated. Select as many or as few rules as the evidence supports; there
+is no target count. Only auto-discovered candidates are listed here; no
+BuckGPT rules are being selected.
 Return only a JSON array of candidate integer IDs to retain. Use the IDs shown
-below; do not create names, SQL, or explanations. Return [] if none are
-defensibly critical.
+below; do not create names, SQL, or explanations. Return [] if none qualify.
 
 Business context:
 {context}
@@ -358,18 +371,21 @@ Exportable profiling candidates (no sample records):
         temperature=0.0,
         response_mime_type="application/json",
     )
+    retry_reason = None
     for attempt in range(2):
         response = client.models.generate_content(
             model=context.get("gemini_model", "gemini-2.5-flash"),
             contents=prompt if attempt == 0 else (
-                prompt + "\nYour previous response did not identify valid candidate IDs. "
-                "Return only the integer IDs from the candidate list as a JSON array."
+                prompt + ("\nYour previous response was invalid: {}. "
+                          "Return only valid integer IDs from the candidate list "
+                          "as a JSON array.").format(retry_reason)
             ),
             config=config,
         )
         try:
             return _parse_critical_profile_selection(response.text or "", expectations)
         except ValueError as exc:
+            retry_reason = str(exc)
             if attempt == 1:
                 raise ValueError(
                     "Gemini returned an invalid critical profiling rule selection "

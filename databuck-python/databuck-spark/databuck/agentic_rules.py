@@ -46,6 +46,9 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         raise ValueError("context['rule_count'] must be between 1 and 50")
 
     reference_paths = _get_reference_paths(context)
+    allowed_sources = {os.path.basename(path) for path in reference_paths}
+    if any(value for key, value in context.items() if key not in _CONTROL_CONTEXT_KEYS):
+        allowed_sources.add("business_context")
     pdf_paths = [path for path in reference_paths if path.lower().endswith(".pdf")]
     word_documents = [
         {"name": os.path.basename(path), "text": _read_docx_text(path)}
@@ -57,8 +60,9 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         model=context.get("gemini_model", DEFAULT_MODEL),
         prompt=prompt,
         pdf_paths=pdf_paths,
+        allowed_sources=allowed_sources,
     )
-    rules = _parse_rules(response_text)
+    rules = _parse_rules(response_text, allowed_sources)
 
     if not rules:
         raise ValueError("Gemini did not return any valid SQL rules")
@@ -74,6 +78,7 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
     for index, rule in enumerate(returned_rules, start=1):
         print("\nRule {}: {}".format(index, rule["name"]))
         print("Description: {}".format(rule["description"]))
+        print("Source document: {}".format(rule["source_document"]))
         print("Reference context: {}".format(rule["reference_context"]))
         print("Audit status: {}".format(rule["audit_status"]))
         print("Audit reason: {}".format(rule["audit_reason"]))
@@ -119,13 +124,16 @@ controls. The domain name alone is not a policy statement and cannot justify
 a rule without an explicit supporting statement.
 
 Return only a JSON array. Every item must contain exactly these string fields:
-name, description, reference_context, sql.
+name, description, source_document, reference_context, sql.
 
 Reference requirements:
 - Every rule must be supported by exactly one explicit policy or business
   statement from the supplied context or reference documents.
 - reference_context must quote that exact supporting statement. Do not
   paraphrase, combine statements, or claim a reference that does not exist.
+- source_document must be the exact filename from Reference document names
+  containing the quoted statement. If the statement instead comes from the
+  Business context block, use "business_context". Do not invent a filename.
 - Do not infer additional business meaning, ID patterns, allowed values,
   thresholds, column relationships, or statuses that are not explicitly stated.
 - Do not downgrade a "valid" requirement into a null/empty check. A validity
@@ -182,7 +190,8 @@ Word document text:
 
 
 def _generate_and_audit_with_gemini(
-    api_key: str, model: str, prompt: str, pdf_paths: list[str]
+    api_key: str, model: str, prompt: str, pdf_paths: list[str],
+    allowed_sources: set[str],
 ) -> tuple[str, str]:
     try:
         from google import genai
@@ -209,7 +218,7 @@ def _generate_and_audit_with_gemini(
             ),
         )
         candidate_response_text = (response.text or "").strip()
-        candidate_rules = _parse_rules(candidate_response_text)
+        candidate_rules = _parse_rules(candidate_response_text, allowed_sources)
         if not candidate_rules:
             return candidate_response_text, "[]"
 
@@ -242,7 +251,9 @@ rule_index (integer, starting at 1), audit_status (PASSED or FAILED), and
 audit_reason (string).
 
 Pass a rule only when all conditions are true:
-- Its reference_context exactly quotes one explicit reference statement.
+- Its reference_context exactly quotes one explicit statement in its named
+  source_document. The filename must identify the document containing the
+  quote; "business_context" must identify a statement in Business context.
 - Its SQL checks exactly the control stated in that reference.
 - The SQL uses only the supplied DataFrame columns.
 - The SQL has exactly this form: SELECT * FROM {placeholder} WHERE
@@ -353,7 +364,7 @@ def _read_docx_text(path: str) -> str:
     return result
 
 
-def _parse_rules(response_text: str) -> list[dict[str, str]]:
+def _parse_rules(response_text: str, allowed_sources: set[str]) -> list[dict[str, str]]:
     try:
         raw_rules = json.loads(_strip_markdown_fence(response_text))
     except json.JSONDecodeError as exc:
@@ -369,11 +380,13 @@ def _parse_rules(response_text: str) -> list[dict[str, str]]:
 
         name = str(raw_rule.get("name", "")).strip()
         description = str(raw_rule.get("description", "")).strip()
+        source_document = str(raw_rule.get("source_document", "")).strip()
         reference_context = str(raw_rule.get("reference_context", "")).strip()
         sql = str(raw_rule.get("sql", "")).strip()
         if (
             not name
             or not description
+            or source_document not in allowed_sources
             or not reference_context
             or not re.match(r"^SELECT\b", sql, re.IGNORECASE)
         ):
@@ -387,6 +400,7 @@ def _parse_rules(response_text: str) -> list[dict[str, str]]:
             {
                 "name": name,
                 "description": description,
+                "source_document": source_document,
                 "reference_context": reference_context,
                 "sql": sql,
             }

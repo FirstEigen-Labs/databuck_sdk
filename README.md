@@ -48,6 +48,9 @@ profiling rules** for export using schema and rule metadata. This selection
 does not filter BuckGPT rules or send sample records. For JSON output, a later
 action assignment uses up to five sample rows to classify exported rules as
 `warn`, `drop`, or `fail`; YAML output has no action assignment.
+One discovered rule can yield several exportable candidates. The selector uses
+business context to decide how many qualify, without a fixed count. The output
+shows retained profiling and BuckGPT counts separately.
 
 See the [Python SDK README](databuck-python/databuck-spark/README.md) for full
 setup, JSON and YAML examples, and Lakeflow pipeline usage.

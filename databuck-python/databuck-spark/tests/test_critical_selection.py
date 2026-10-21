@@ -116,6 +116,21 @@ class CriticalSelectionTests(unittest.TestCase):
             )
         self.assertEqual(selected, set())
 
+    def test_selection_has_no_fixed_count_limit(self):
+        expectations = {"not_null_field_{}".format(index): "`field_{}` IS NOT NULL".format(index)
+                        for index in range(107)}
+        self.client.models.generate_content.return_value.text = str(list(range(1, 108)))
+        with patch.dict(sys.modules, self.modules):
+            selected = _select_critical_profile_expectations(
+                expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"}, [],
+            )
+        self.assertEqual(selected, set(expectations))
+        self.client.models.generate_content.assert_called_once()
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn("is no target count", prompt)
+        self.assertNotIn("BuckGPT_Rule_", prompt)
+
     def test_profile_metadata_excludes_sample_values(self):
         metadata = _profile_rule_metadata([
             {"ruleType": "Null Check", "columnName": "account_id",
