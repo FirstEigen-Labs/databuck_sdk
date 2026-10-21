@@ -8,7 +8,7 @@ os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
 
 from databuck.agentic_rules import has_rule_reference_context
 from databuck.lake_rules import (
-    _profile_rule_metadata, _select_critical_profile_expectations,
+    _profile_rule_metadata, _select_critical_expectations,
 )
 
 
@@ -37,7 +37,7 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertFalse(has_rule_reference_context({"domain_name": "banking"}))
         self.client.models.generate_content.return_value.text = '["not_null_account_id"]'
         with patch.dict(sys.modules, self.modules):
-            selected = _select_critical_profile_expectations(
+            selected = _select_critical_expectations(
                 self.expectations, self.df, {
                     "domain_name": "banking", "gemini_api_key": "test-key",
                     "business_context": "Account records must be linkable",
@@ -58,7 +58,7 @@ class CriticalSelectionTests(unittest.TestCase):
         self.client.models.generate_content.return_value.text = '["invented_rule"]'
         with patch.dict(sys.modules, self.modules):
             with self.assertRaisesRegex(ValueError, "unknown expectation names: invented_rule"):
-                _select_critical_profile_expectations(
+                _select_critical_expectations(
                     self.expectations, self.df,
                     {"domain_name": "banking", "gemini_api_key": "test-key"},
                     self.metadata,
@@ -71,7 +71,7 @@ class CriticalSelectionTests(unittest.TestCase):
             '"reason":"Required for reconciliation"}]}'
         )
         with patch.dict(sys.modules, self.modules):
-            selected = _select_critical_profile_expectations(
+            selected = _select_critical_expectations(
                 self.expectations, self.df,
                 {"domain_name": "banking", "gemini_api_key": "test-key"},
                 self.metadata,
@@ -82,7 +82,7 @@ class CriticalSelectionTests(unittest.TestCase):
     def test_selection_accepts_candidate_ids(self):
         self.client.models.generate_content.return_value.text = '[2]'
         with patch.dict(sys.modules, self.modules):
-            selected = _select_critical_profile_expectations(
+            selected = _select_critical_expectations(
                 self.expectations, self.df,
                 {"domain_name": "banking", "gemini_api_key": "test-key"},
                 self.metadata,
@@ -92,13 +92,35 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertIn('"id": 2', prompt)
         self.assertIn('"name": "not_null_account_id"', prompt)
 
+    def test_selection_can_choose_buckgpt_rule_using_its_reference(self):
+        expectations = dict(self.expectations,
+                            BuckGPT_Rule_001="NOT COALESCE((balance < 0), FALSE)")
+        buckgpt_metadata = {"BuckGPT_Rule_001": {
+            "description": "Balances cannot be negative",
+            "source_document": "banking_policy.pdf",
+            "reference_context": "Balances must not be negative.",
+            "invalid_row_sql": "SELECT * FROM {{DATAFRAME}} WHERE balance < 0",
+        }}
+        self.client.models.generate_content.return_value.text = "[3]"
+        with patch.dict(sys.modules, self.modules):
+            selected = _select_critical_expectations(
+                expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                self.metadata, buckgpt_metadata,
+            )
+        self.assertEqual(selected, {"BuckGPT_Rule_001"})
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn('"origin": "BuckGPT"', prompt)
+        self.assertIn('"source_document": "banking_policy.pdf"', prompt)
+        self.assertIn("Balances must not be negative.", prompt)
+
     def test_selection_retries_a_malformed_response_once(self):
         self.client.models.generate_content.side_effect = [
             SimpleNamespace(text='{"unexpected":"shape"}'),
             SimpleNamespace(text='["not_null_account_id"]'),
         ]
         with patch.dict(sys.modules, self.modules):
-            selected = _select_critical_profile_expectations(
+            selected = _select_critical_expectations(
                 self.expectations, self.df,
                 {"domain_name": "banking", "gemini_api_key": "test-key"},
                 self.metadata,
@@ -109,7 +131,7 @@ class CriticalSelectionTests(unittest.TestCase):
     def test_selection_can_return_no_critical_profile_rules(self):
         self.client.models.generate_content.return_value.text = '[]'
         with patch.dict(sys.modules, self.modules):
-            selected = _select_critical_profile_expectations(
+            selected = _select_critical_expectations(
                 self.expectations, self.df,
                 {"domain_name": "banking", "gemini_api_key": "test-key"},
                 self.metadata,
@@ -121,7 +143,7 @@ class CriticalSelectionTests(unittest.TestCase):
                         for index in range(107)}
         self.client.models.generate_content.return_value.text = str(list(range(1, 108)))
         with patch.dict(sys.modules, self.modules):
-            selected = _select_critical_profile_expectations(
+            selected = _select_critical_expectations(
                 expectations, self.df,
                 {"domain_name": "banking", "gemini_api_key": "test-key"}, [],
             )

@@ -156,30 +156,13 @@ exported; an unsupported query fails the export.
 The call prints the auto-discovered rules and the BuckGPT rules before it
 exports them. Some auto-discovered rules may not be exportable as row-level
 Lakeflow expectations; the export contains only those that can be converted.
-Each printed BuckGPT rule includes `Source document`, the PDF or DOCX filename
-containing its quoted `Reference context`, or `business_context` when the quote
-comes from the supplied business text. The audited BuckGPT rule dictionary also
-contains `source_document`. The JSON and YAML expectation files contain SQL
-conditions only and do not include source metadata.
-If Gemini omits the source filename or returns an invalid rule shape, BuckGPT
-retries generation once with the allowed filenames and validation feedback.
-If the retry still produces no valid rules, the error states which field failed.
-When `domain_name` is supplied, one additional Gemini call reviews the
-exportable auto-discovered profiling rules as a domain and database expert.
-It receives the DataFrame schema and relevant auto-discovery rule metadata,
-without sample records.
-Only profiling rules selected as business critical are exported; BuckGPT rules
-are not filtered by this step. The selection applies to JSON and YAML exports.
-If no critical profiling rule is selected, BuckGPT rules can still be exported.
-The raw auto-discovery count can differ from the number of exportable profiling
-candidates because some discovered rules produce several column expectations,
-while others cannot be exported. Gemini decides how many auto-discovered
-candidates are critical using the supplied business context; there is no fixed
-count or percentage. The output prints separate counts for retained
-auto-discovered rules and BuckGPT rules.
-The same `domain_name` is included in BuckGPT's generation and audit prompts
-to interpret policy terminology; it does not replace an explicit policy or
-business statement supporting a BuckGPT rule.
+Each printed BuckGPT rule shows its supporting document and reference quote.
+The exported JSON and YAML files contain the rule conditions. When
+`domain_name` is supplied, business-critical selection applies to both
+auto-discovered and BuckGPT rules. The notebook prints the retained count for
+each source. This selection has no fixed rule count.
+The number of exportable auto-discovered checks may differ from the raw
+discovery count because a discovered rule can cover several columns.
 The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
 notebook driver. PDF files are uploaded to Gemini; text from Word documents is
 extracted locally and included in the generation and audit prompts. Images or

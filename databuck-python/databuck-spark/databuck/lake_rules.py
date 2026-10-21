@@ -189,26 +189,34 @@ class DiscoveredRules(list):
                      identifier, identifier, format(mean, ".17g"),
                      format(threshold, ".15g"), format(std, ".17g")))
 
-        if isinstance(context, dict) and "domain_name" in context and expectations:
-            if df is None:
-                raise ValueError("A DataFrame is required to select critical profiling rules")
-            candidate_count = len(expectations)
-            print("DataBuck: selecting critical auto-discovered rules "
-                  "({} exportable candidates from {} discovered rules)".format(
-                      candidate_count, len(self)), flush=True)
-            selected = _select_critical_profile_expectations(
-                expectations, df, context, _profile_rule_metadata(self, expectations)
-            )
-            expectations = {name: expression for name, expression in expectations.items()
-                            if name in selected}
-            print("DataBuck: selected {} of {} critical auto-discovered rules".format(
-                len(expectations), candidate_count), flush=True)
-
+        auto_expectation_names = set(expectations)
         auto_expectation_count = len(expectations)
+        buckgpt_metadata = {}
         for index, rule in enumerate(context_rules or (), start=1):
             name = "BuckGPT_Rule_{:03d}".format(index)
             expectations[name] = _context_rule_expectation(rule, name)
-        if context_rules:
+            buckgpt_metadata[name] = {
+                "description": rule.get("description"),
+                "source_document": rule.get("source_document"),
+                "reference_context": rule.get("reference_context"),
+                "invalid_row_sql": rule.get("sql"),
+            }
+        if isinstance(context, dict) and "domain_name" in context and expectations:
+            if df is None:
+                raise ValueError("A DataFrame is required to select critical rules")
+            print("DataBuck: selecting critical rules ({} auto-discovered candidates "
+                  "from {} discovered rules, {} BuckGPT candidates)".format(
+                      auto_expectation_count, len(self), len(buckgpt_metadata)), flush=True)
+            selected = _select_critical_expectations(
+                expectations, df, context, _profile_rule_metadata(self, expectations),
+                buckgpt_metadata,
+            )
+            expectations = {name: expression for name, expression in expectations.items()
+                            if name in selected}
+            print("DataBuck: selected {} auto-discovered and {} BuckGPT critical rules".format(
+                len(auto_expectation_names.intersection(expectations)),
+                sum(name in expectations for name in buckgpt_metadata)), flush=True)
+        elif context_rules:
             print("DataBuck: exporting {} auto-discovered and {} BuckGPT rules "
                   "({} total)".format(auto_expectation_count, len(context_rules),
                                       len(expectations)), flush=True)
@@ -301,7 +309,8 @@ def _profile_rule_metadata(rules, expectations):
     return metadata
 
 
-def _select_critical_profile_expectations(expectations, df, context, profile_metadata):
+def _select_critical_expectations(expectations, df, context, profile_metadata,
+                                  buckgpt_metadata=None):
     domain_name = context.get("domain_name")
     if not isinstance(domain_name, str) or not domain_name.strip():
         raise ValueError("context['domain_name'] must be a non-empty string")
@@ -320,13 +329,16 @@ def _select_critical_profile_expectations(expectations, df, context, profile_met
                                        "rule_count", "include_failed_rules", "domain_name"}}
     metadata_by_name = {item["expectation_name"]: item for item in profile_metadata
                         if item.get("expectation_name") in expectations}
+    buckgpt_metadata = buckgpt_metadata or {}
     candidates = [
         {"id": index, "name": name, "expression": expression,
-         "metadata": metadata_by_name.get(name)}
+         "origin": "BuckGPT" if name in buckgpt_metadata else "auto-discovered",
+         "metadata": buckgpt_metadata[name] if name in buckgpt_metadata
+         else metadata_by_name.get(name)}
         for index, (name, expression) in enumerate(expectations.items(), start=1)
     ]
     prompt = """Act as a {domain_name} subject matter expert and a database expert.
-Review the DataBuck auto-discovered profiling candidates below. Select only
+Review the DataBuck auto-discovered and BuckGPT candidates below. Select only
 the rules whose failure would materially affect business decisions, regulatory
 or policy compliance, financial correctness, customer outcomes, or the ability
 to use this dataset for its stated business purpose.
@@ -341,14 +353,14 @@ critical. Use the schema, discovery metadata, rule expression, and business
 context to judge impact. Do not infer a business requirement from a column
 name alone.
 
-Review each distinct SQL check. Retain it only when you can identify a concrete
-business consequence if that exact check fails, supported by the supplied
-business context, schema, and rule metadata. A profiling pattern or length
-learned from observed data is not automatically a business requirement. Do not
-retain all completeness, pattern, or length checks merely because the domain
-is regulated. Select as many or as few rules as the evidence supports; there
-is no target count. Only auto-discovered candidates are listed here; no
-BuckGPT rules are being selected.
+Review each distinct SQL check from either origin. Retain it only when you can
+identify a concrete business consequence if that exact check fails, supported
+by the supplied business context, schema, and candidate metadata. A profiling
+pattern or length learned from observed data is not automatically a business
+requirement. A BuckGPT rule passing its policy audit is not automatically
+business critical; use its quoted reference and source to judge impact. Do not
+retain every rule merely because the domain is regulated. Select as many or as
+few rules as the evidence supports; there is no target count.
 Return only a JSON array of candidate integer IDs to retain. Use the IDs shown
 below; do not create names, SQL, or explanations. Return [] if none qualify.
 
@@ -358,7 +370,7 @@ Business context:
 DataFrame schema:
 {schema}
 
-Exportable profiling candidates (no sample records):
+Exportable auto-discovered and audited BuckGPT candidates (no sample records):
 {candidates}
 """.format(
         domain_name=domain_name.strip(),
@@ -388,7 +400,7 @@ Exportable profiling candidates (no sample records):
             retry_reason = str(exc)
             if attempt == 1:
                 raise ValueError(
-                    "Gemini returned an invalid critical profiling rule selection "
+                    "Gemini returned an invalid critical rule selection "
                     "after one retry: {}".format(exc)
                 ) from exc
 
