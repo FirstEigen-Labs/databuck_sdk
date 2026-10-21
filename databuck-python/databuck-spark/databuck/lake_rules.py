@@ -194,7 +194,7 @@ class DiscoveredRules(list):
                 raise ValueError("A DataFrame is required to select critical profiling rules")
             print("DataBuck: selecting critical auto-discovered rules", flush=True)
             selected = _select_critical_profile_expectations(
-                expectations, df, context, _profile_rule_metadata(self)
+                expectations, df, context, _profile_rule_metadata(self, expectations)
             )
             expectations = {name: expression for name, expression in expectations.items()
                             if name in selected}
@@ -249,8 +249,15 @@ def _context_rule_expectation(rule, name):
     return "NOT COALESCE(({}), FALSE)".format(invalid)
 
 
-def _profile_rule_metadata(rules):
+def _profile_rule_metadata(rules, expectations):
     metadata = []
+    prefixes = {
+        "Null Check": "not_null",
+        "Default Pattern Check": "valid_pattern",
+        "Length Check": "valid_length",
+        "Date Rule": "valid_date",
+        "Value Anomaly Check": "valid_value",
+    }
     for rule in rules:
         rule_type = rule.get("ruleType")
         if rule_type not in _PROFILE_METADATA_PARAMETERS:
@@ -258,15 +265,29 @@ def _profile_rule_metadata(rules):
         parameters = rule.get("parameters") or {}
         if not isinstance(parameters, dict):
             parameters = {}
-        metadata.append({
-            "rule_type": rule_type,
-            "column_name": rule.get("columnName"),
-            "threshold": rule.get("threshold"),
-            "parameters": {
-                key: parameters[key]
-                for key in _PROFILE_METADATA_PARAMETERS[rule_type] if key in parameters
-            },
-        })
+        columns = [rule.get("columnName")]
+        if (rule_type == "Length Check"
+                and isinstance(parameters.get("lengthColumns"), dict)
+                and parameters["lengthColumns"]):
+            columns = list(parameters["lengthColumns"])
+        elif rule_type == "Value Anomaly Check":
+            columns = parameters.get("columns") or columns
+        for column in columns:
+            if not isinstance(column, str) or not column.strip():
+                continue
+            name = _expectation_name(prefixes[rule_type], column)
+            if name not in expectations:
+                continue
+            metadata.append({
+                "expectation_name": name,
+                "rule_type": rule_type,
+                "column_name": column.replace("`", "").strip(),
+                "threshold": rule.get("threshold"),
+                "parameters": {
+                    key: parameters[key]
+                    for key in _PROFILE_METADATA_PARAMETERS[rule_type] if key in parameters
+                },
+            })
     return metadata
 
 
@@ -287,8 +308,15 @@ def _select_critical_profile_expectations(expectations, df, context, profile_met
     business_context = {key: value for key, value in context.items()
                         if key not in {"gemini_api_key", "gemini_model", "pdf_paths",
                                        "rule_count", "include_failed_rules", "domain_name"}}
+    metadata_by_name = {item["expectation_name"]: item for item in profile_metadata
+                        if item.get("expectation_name") in expectations}
+    candidates = [
+        {"id": index, "name": name, "expression": expression,
+         "metadata": metadata_by_name.get(name)}
+        for index, (name, expression) in enumerate(expectations.items(), start=1)
+    ]
     prompt = """Act as a {domain_name} subject matter expert and a database expert.
-Review the DataBuck auto-discovered profiling expectations below. Select only
+Review the DataBuck auto-discovered profiling candidates below. Select only
 the rules whose failure would materially affect business decisions, regulatory
 or policy compliance, financial correctness, customer outcomes, or the ability
 to use this dataset for its stated business purpose.
@@ -303,8 +331,9 @@ critical. Use the schema, discovery metadata, rule expression, and business
 context to judge impact. Do not infer a business requirement from a column
 name alone.
 
-Return only a JSON array of exact expectation names to retain, with no new
-names, SQL changes, or explanation. Return [] if none are defensibly critical.
+Return only a JSON array of candidate integer IDs to retain. Use the IDs shown
+below; do not create names, SQL, or explanations. Return [] if none are
+defensibly critical.
 
 Business context:
 {context}
@@ -312,18 +341,13 @@ Business context:
 DataFrame schema:
 {schema}
 
-Auto-discovery rule metadata (rule type, column, threshold, and applicable
-profiling parameters; no sample records):
-{profile_metadata}
-
-Auto-discovered profiling expectations:
-{expectations}
+Exportable profiling candidates (no sample records):
+{candidates}
 """.format(
         domain_name=domain_name.strip(),
         context=json.dumps(business_context, default=str, ensure_ascii=False),
         schema=df.schema.json(),
-        profile_metadata=json.dumps(profile_metadata, default=str, ensure_ascii=False),
-        expectations=json.dumps(expectations, ensure_ascii=False),
+        candidates=json.dumps(candidates, default=str, ensure_ascii=False),
     )
     client = genai.Client(api_key=api_key)
     config = types.GenerateContentConfig(
@@ -334,9 +358,8 @@ Auto-discovered profiling expectations:
         response = client.models.generate_content(
             model=context.get("gemini_model", "gemini-2.5-flash"),
             contents=prompt if attempt == 0 else (
-                prompt + "\nYour previous response did not identify an exact subset of the "
-                "candidate expectation names. Return only their exact names as a JSON "
-                "array. Do not rename rules or include explanations."
+                prompt + "\nYour previous response did not identify valid candidate IDs. "
+                "Return only the integer IDs from the candidate list as a JSON array."
             ),
             config=config,
         )
@@ -356,7 +379,8 @@ def _parse_critical_profile_selection(response_text, expectations):
     except json.JSONDecodeError as exc:
         raise ValueError("response is not valid JSON") from exc
     if isinstance(result, dict):
-        for key in ("selected_rule_names", "selected_rules", "critical_rules",
+        for key in ("selected_ids", "selected_rule_ids", "candidate_ids",
+                    "selected_rule_names", "selected_rules", "critical_rules",
                     "selected_expectations", "rules"):
             if key in result:
                 result = result[key]
@@ -364,14 +388,20 @@ def _parse_critical_profile_selection(response_text, expectations):
     if not isinstance(result, list):
         raise ValueError("response must contain a list of expectation names")
 
+    candidate_names = list(expectations)
     names = []
     for item in result:
         if isinstance(item, dict):
-            item = next((item[key] for key in ("name", "expectation_name",
-                        "rule_name", "expectation") if key in item), None)
-        if not isinstance(item, str) or not item.strip():
-            raise ValueError("each selected rule must have a name")
-        names.append(item.strip())
+            item = next((item[key] for key in ("id", "candidate_id", "name",
+                        "expectation_name", "rule_name", "expectation") if key in item), None)
+        if isinstance(item, int) and not isinstance(item, bool):
+            if item < 1 or item > len(candidate_names):
+                raise ValueError("candidate ID is outside the available range")
+            names.append(candidate_names[item - 1])
+        elif isinstance(item, str) and item.strip():
+            names.append(item.strip())
+        else:
+            raise ValueError("each selected rule must have a candidate ID or name")
     unknown = sorted(set(names) - set(expectations))
     if unknown:
         raise ValueError("unknown expectation names: {}".format(", ".join(unknown[:3])))
@@ -545,11 +575,15 @@ def _default_patterns(definition):
     return patterns
 
 
-def _add(expectations, prefix, column, expression):
+def _expectation_name(prefix, column):
     name = _NAME_PART.sub("_", column.replace("`", "").strip().lower()).strip("_")
     if not name:
         raise ValueError("Cannot name expectation for column {!r}".format(column))
-    name = "{}_{}".format(prefix, name)
+    return "{}_{}".format(prefix, name)
+
+
+def _add(expectations, prefix, column, expression):
+    name = _expectation_name(prefix, column)
     if name in expectations and expectations[name] != expression:
         raise ValueError("Conflicting expectation name: {}".format(name))
     expectations[name] = expression

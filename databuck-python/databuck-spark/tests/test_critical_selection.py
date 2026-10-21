@@ -21,6 +21,7 @@ class CriticalSelectionTests(unittest.TestCase):
             "not_null_account_id": "`account_id` IS NOT NULL",
         }
         self.metadata = [{
+            "expectation_name": "not_null_account_id",
             "rule_type": "Null Check", "column_name": "account_id",
             "threshold": 0, "parameters": {"nullThreshold": 0},
         }]
@@ -78,6 +79,19 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertEqual(selected, {"not_null_account_id"})
         self.client.models.generate_content.assert_called_once()
 
+    def test_selection_accepts_candidate_ids(self):
+        self.client.models.generate_content.return_value.text = '[2]'
+        with patch.dict(sys.modules, self.modules):
+            selected = _select_critical_profile_expectations(
+                self.expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                self.metadata,
+            )
+        self.assertEqual(selected, {"not_null_account_id"})
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn('"id": 2', prompt)
+        self.assertIn('"name": "not_null_account_id"', prompt)
+
     def test_selection_retries_a_malformed_response_once(self):
         self.client.models.generate_content.side_effect = [
             SimpleNamespace(text='{"unexpected":"shape"}'),
@@ -103,12 +117,16 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertEqual(selected, set())
 
     def test_profile_metadata_excludes_sample_values(self):
-        metadata = _profile_rule_metadata([{
-            "ruleType": "Null Check", "columnName": "account_id",
-            "threshold": 0,
-            "parameters": {"nullThreshold": 0, "sampleValues": ["customer-123"]},
-        }])
+        metadata = _profile_rule_metadata([
+            {"ruleType": "Null Check", "columnName": "account_id",
+             "threshold": 0,
+             "parameters": {"nullThreshold": 0, "sampleValues": ["customer-123"]}},
+            {"ruleType": "Null Check", "columnName": "chargeoff_within_12_mths",
+             "threshold": 5,
+             "parameters": {"nullThreshold": 5}},
+        ], self.expectations)
         self.assertEqual(metadata, [{
+            "expectation_name": "not_null_account_id",
             "rule_type": "Null Check", "column_name": "account_id",
             "threshold": 0, "parameters": {"nullThreshold": 0},
         }])
