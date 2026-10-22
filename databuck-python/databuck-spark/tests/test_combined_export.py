@@ -17,6 +17,58 @@ from databuck.lake_rules import (
 
 
 class CombinedExportTests(unittest.TestCase):
+    def test_buckgpt_uniqueness_is_exported_as_dataset_check(self):
+        from databuck.agentic_rules import _uniqueness_sql
+
+        check = {
+            "name": "Unique loan ID", "description": "One row per loan.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Loan ID identifies a loan.",
+            "check_type": "uniqueness", "columns": ["loan_id"],
+            "sql": _uniqueness_sql(["loan_id"]),
+            "audit_status": "PASSED", "audit_reason": "Key is justified.",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            json_path = Path(directory) / "checks.json"
+            yaml_path = Path(directory) / "checks.yaml"
+            DiscoveredRules([]).to_lake(str(json_path), context_rules=[check])
+            DiscoveredRules([]).to_lake(str(yaml_path), context_rules=[check])
+            exported = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(exported["warn"], {})
+            self.assertEqual(exported["dataset_checks"][0]["sql"], check["sql"])
+            yaml_text = yaml_path.read_text(encoding="utf-8")
+            self.assertIn("expectations: {}", yaml_text)
+            self.assertIn("dataset_checks:", yaml_text)
+            self.assertIn("duplicate_count", yaml_text)
+
+    def test_buckgpt_uniqueness_joins_critical_selection(self):
+        from databuck.agentic_rules import _uniqueness_sql
+
+        check = {
+            "name": "Unique loan ID", "description": "One row per loan.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Loan ID identifies a loan.",
+            "check_type": "uniqueness", "columns": ["loan_id"],
+            "sql": _uniqueness_sql(["loan_id"]),
+            "audit_status": "PASSED", "audit_reason": "Key is justified.",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "checks.json"
+            with patch("databuck.lake_rules._select_critical_expectations",
+                       return_value={"BuckGPT_Rule_001"}) as select, \
+                 patch("databuck.lake_rules._classify_actions_with_llm") as classify:
+                DiscoveredRules([]).to_lake(
+                    str(destination), df=Mock(),
+                    context={"domain_name": "banking", "gemini_api_key": "test-key"},
+                    context_rules=[check],
+                )
+            self.assertIn("BuckGPT_Rule_001", select.call_args.args[0])
+            self.assertEqual(select.call_args.args[4]["BuckGPT_Rule_001"]
+                             ["check_type"], "uniqueness")
+            classify.assert_not_called()
+            self.assertEqual(json.loads(destination.read_text(encoding="utf-8"))
+                             ["dataset_checks"][0]["source_document"], "BuckGPT_Intel")
+
     def test_table_name_loads_dataframe_for_json_discovery(self):
         dataframe = object()
         session = Mock()

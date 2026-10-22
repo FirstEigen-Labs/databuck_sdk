@@ -192,14 +192,41 @@ class DiscoveredRules(list):
         auto_expectation_names = set(expectations)
         auto_expectation_count = len(expectations)
         buckgpt_metadata = {}
+        dataset_checks = {}
         for index, rule in enumerate(context_rules or (), start=1):
             name = "BuckGPT_Rule_{:03d}".format(index)
-            expectations[name] = _context_rule_expectation(rule, name)
+            if rule.get("check_type") == "uniqueness":
+                if rule.get("audit_status") != "PASSED":
+                    raise ValueError("{} must be an audited, passed context rule".format(name))
+                from .agentic_rules import INTEL_SOURCE, _uniqueness_sql
+
+                columns = rule.get("columns")
+                if (rule.get("source_document") != INTEL_SOURCE
+                        or not isinstance(columns, list) or not columns
+                        or any(not isinstance(column, str) or not column.strip()
+                               for column in columns)
+                        or len(columns) != len(set(columns))
+                        or rule.get("sql") != _uniqueness_sql(columns)):
+                    raise ValueError("{} has an invalid uniqueness check".format(name))
+                dataset_checks[name] = {
+                    "name": name,
+                    "description": rule.get("description"),
+                    "source_document": rule.get("source_document"),
+                    "reference_context": rule.get("reference_context"),
+                    "columns": rule.get("columns"),
+                    "sql": rule.get("sql"),
+                }
+                # Include dataset checks in the same critical-selection review.
+                expectations[name] = rule["sql"]
+            else:
+                expectations[name] = _context_rule_expectation(rule, name)
             buckgpt_metadata[name] = {
                 "description": rule.get("description"),
                 "source_document": rule.get("source_document"),
                 "reference_context": rule.get("reference_context"),
-                "invalid_row_sql": rule.get("sql"),
+                "check_type": rule.get("check_type", "row"),
+                ("dataset_check_sql" if name in dataset_checks else "invalid_row_sql"):
+                    rule.get("sql"),
             }
         if isinstance(context, dict) and "domain_name" in context and expectations:
             if df is None:
@@ -221,12 +248,18 @@ class DiscoveredRules(list):
                   "({} total)".format(auto_expectation_count, len(context_rules),
                                       len(expectations)), flush=True)
 
-        if not expectations:
+        dataset_checks = {name: check for name, check in dataset_checks.items()
+                          if name in expectations}
+        expectations = {name: expression for name, expression in expectations.items()
+                        if name not in dataset_checks}
+
+        if not expectations and not dataset_checks:
             raise ValueError("No Databricks expectations are available to export")
         if export_format == "yaml":
             self.action_decisions = {}
             return write_expectations(
                 expectations, path_where_needs_to_export, table_name=table_name,
+                dataset_checks=dataset_checks,
             )
         if context is None:
             decisions = {name: {"action": "warn", "reason": "No action classification requested."}
@@ -234,15 +267,18 @@ class DiscoveredRules(list):
         else:
             if df is None:
                 raise ValueError("A DataFrame is required to classify rule actions")
-            print("DataBuck: assigning warn/drop/fail actions", flush=True)
-            decisions = _classify_actions_with_llm(expectations, df, context)
+            if expectations:
+                print("DataBuck: assigning warn/drop/fail actions", flush=True)
+                decisions = _classify_actions_with_llm(expectations, df, context)
+            else:
+                decisions = {}
 
         grouped = {action: {} for action in _ACTIONS}
         for name, expression in expectations.items():
             grouped[decisions[name]["action"]][name] = expression
         self.action_decisions = decisions
         return write_expectations(
-            grouped, path_where_needs_to_export
+            grouped, path_where_needs_to_export, dataset_checks=dataset_checks,
         )
 
 
@@ -360,6 +396,9 @@ pattern or length learned from observed data is not automatically a business
 requirement. A BuckGPT rule passing its policy audit is not automatically
 business critical; use its reference or stated rationale and source to judge
 impact. Do not retain every rule merely because the domain is regulated.
+BuckGPT uniqueness checks are dataset-level duplicate-group queries. Assess
+their key rationale and business impact, but do not treat them as row-level
+Lakeflow expectations.
 
 Prioritize the most consequential rules for this dataset's business purpose.
 Return the smallest defensible set that a business reviewer can examine and
@@ -379,7 +418,7 @@ Business context:
 DataFrame schema:
 {schema}
 
-Exportable auto-discovered and audited BuckGPT candidates (no sample records):
+Auto-discovered and audited BuckGPT candidates (no sample records):
 {candidates}
 """.format(
         domain_name=domain_name.strip(),
@@ -648,16 +687,18 @@ def _yaml_scalar(value):
     return value if _YAML_PLAIN_SCALAR.fullmatch(value) else json.dumps(value, ensure_ascii=False)
 
 
-def write_expectations(expectations, path_where_needs_to_export, *, table_name=None):
+def write_expectations(expectations, path_where_needs_to_export, *, table_name=None,
+                       dataset_checks=None):
     export_format = _export_format(path_where_needs_to_export)
     output = Path(path_where_needs_to_export)
+    dataset_checks = dataset_checks or {}
     if export_format == "yaml":
         if table_name is not None:
             table_name = _validated_table_name(table_name)
-        if not expectations:
+        if not expectations and not dataset_checks:
             raise ValueError("No Databricks expectations are available to export")
     else:
-        if not any(expectations.get(action) for action in _ACTIONS):
+        if not any(expectations.get(action) for action in _ACTIONS) and not dataset_checks:
             raise ValueError("No Databricks expectations are available to export")
     if export_format == "json" and output.suffix.lower() != ".json":
         output /= "databuck_expectations.json"
@@ -666,12 +707,18 @@ def write_expectations(expectations, path_where_needs_to_export, *, table_name=N
         if export_format == "yaml":
             if table_name is not None:
                 stream.write("table: {}\n\n".format(_yaml_scalar(table_name)))
-            stream.write("expectations:\n")
+            stream.write("expectations:\n" if expectations else "expectations: {}\n")
             for name, expression in expectations.items():
                 stream.write("  {}: {}\n".format(
                     _yaml_scalar(name), json.dumps(expression, ensure_ascii=False)
                 ))
+            if dataset_checks:
+                stream.write("dataset_checks: {}\n".format(
+                    json.dumps(list(dataset_checks.values()), ensure_ascii=False)))
         else:
-            json.dump(expectations, stream, indent=2, ensure_ascii=False)
+            output_data = dict(expectations)
+            if dataset_checks:
+                output_data["dataset_checks"] = list(dataset_checks.values())
+            json.dump(output_data, stream, indent=2, ensure_ascii=False)
             stream.write("\n")
     return str(output)

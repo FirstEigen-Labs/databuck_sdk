@@ -149,14 +149,16 @@ The single call runs profile discovery and context-aware BuckGPT discovery,
 then writes both sets of row expectations into one file. The output extension
 selects JSON or YAML. Context-aware expectations are named `BuckGPT_Rule_001`,
 `BuckGPT_Rule_002`, etc. Their
-invalid-row SQL queries are converted to Lakeflow pass conditions. Only
-audited, passed BuckGPT rules in the required
-`SELECT * FROM {{DATAFRAME}} WHERE <invalid-row condition>` shape can be
-exported; an unsupported query fails the export.
+invalid-row SQL queries are converted to Lakeflow pass conditions. Audited,
+passed row-level BuckGPT rules must use
+`SELECT * FROM {{DATAFRAME}} WHERE <invalid-row condition>`; an unsupported
+row-level query fails the export. Audited uniqueness checks use the separate
+`dataset_checks` section described below.
 The call prints the auto-discovered rules and the BuckGPT rules before it
 exports them. Some auto-discovered rules may not be exportable as row-level
 Lakeflow expectations; the export contains only those that can be converted.
-Each printed BuckGPT rule shows its supporting document and reference quote.
+Each printed BuckGPT rule shows either its supporting document and reference
+quote or `BuckGPT_Intel` and its general business rationale.
 The exported JSON and YAML files contain the rule conditions. When
 `domain_name` is supplied, business-critical selection applies to both
 auto-discovered and BuckGPT rules. The notebook prints the retained count for
@@ -165,11 +167,17 @@ The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
 notebook driver. PDF files are uploaded to Gemini; text from Word documents is
 extracted locally and included in the generation and audit prompts. Images or
 scanned pages in a Word document are not read.
-BuckGPT attaches all supplied PDFs to one generation request and creates only
-rules backed by explicit statements in those documents or Business context.
-It chooses the number of rules from the supported policy controls;
-`rule_count` is no longer needed. A domain name guides interpretation and
-critical selection but does not generate rules on its own.
+BuckGPT sends up to 50 sample records to a document-backed generation request
+with all supplied PDFs and to a separate general-rule request. The first
+request creates rules supported by explicit document or Business context
+statements. The second creates useful inferred rules labeled `BuckGPT_Intel`.
+Both sets are audited together, then passed through critical selection and
+export. General rules can include non-negative and cross-column checks. When
+BuckGPT identifies a defensible unique business key, the JSON or YAML export
+places its duplicate-group SQL in `dataset_checks`. Run these checks against
+the full dataset separately, replacing `{{DATAFRAME}}` with the source table
+or view name. They are not Lakeflow row expectations and do not receive
+warn/drop/fail actions. `rule_count` is no longer needed.
 
 To export only automatic profiling rules, omit `context`:
 

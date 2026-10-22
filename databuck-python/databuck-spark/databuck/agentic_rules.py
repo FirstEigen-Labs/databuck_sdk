@@ -10,6 +10,7 @@ from xml.etree import ElementTree
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 DATAFRAME_PLACEHOLDER = "{{DATAFRAME}}"
+INTEL_SOURCE = "BuckGPT_Intel"
 _CONTROL_CONTEXT_KEYS = {
     "gemini_api_key", "gemini_model", "rule_count", "pdf_paths",
     "include_failed_rules", "domain_name",
@@ -18,13 +19,14 @@ _CONTROL_CONTEXT_KEYS = {
 
 def has_rule_reference_context(context: dict) -> bool:
     """Whether context supplies a domain or statements for BuckGPT rules."""
-    return bool(context.get("pdf_paths")) or any(
+    return bool(context.get("pdf_paths") or context.get("domain_name")) or any(
         value for key, value in context.items() if key not in _CONTROL_CONTEXT_KEYS
     )
 
 
 def _allowed_rule_sources(context: dict, reference_paths: list[str]) -> set[str]:
-    sources = {os.path.basename(path) for path in reference_paths}
+    sources = {INTEL_SOURCE}
+    sources.update(os.path.basename(path) for path in reference_paths)
     if any(value for key, value in context.items() if key not in _CONTROL_CONTEXT_KEYS):
         sources.add("business_context")
     return sources
@@ -55,27 +57,37 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         {"name": os.path.basename(path), "text": _read_docx_text(path)}
         for path in reference_paths if path.lower().endswith(".docx")
     ]
-    prompt = _build_prompt(df, context, reference_paths, word_documents)
+    schema_columns = [field.name for field in df.schema.fields]
+    sample_rows = _sample_rows(df)
+    prompt = _build_prompt(df, context, reference_paths, word_documents,
+                           sample_rows=sample_rows)
+    general_prompt = _build_general_prompt(df, context, sample_rows)
     response_text, audit_response_text = _generate_and_audit_with_gemini(
         api_key=api_key,
         model=context.get("gemini_model", DEFAULT_MODEL),
         prompt=prompt,
+        general_prompt=general_prompt,
         pdf_paths=pdf_paths,
         allowed_sources=allowed_sources,
+        schema_columns=schema_columns,
     )
-    rules = _parse_rules(response_text, allowed_sources)
+    rules = _parse_rules(response_text, allowed_sources,
+                         schema_columns=schema_columns)
 
     if not rules:
         print("BuckGPT: no eligible rules found", flush=True)
         return []
 
     _apply_audit_results(rules, audit_response_text)
-    print("BuckGPT: audit passed {} document-backed rules".format(
-        sum(rule["audit_status"] == "PASSED" for rule in rules),
+    print("BuckGPT: audit passed {} document-backed and {} general rules".format(
+        sum(rule["audit_status"] == "PASSED" for rule in rules
+            if rule["source_document"] != INTEL_SOURCE),
+        sum(rule["audit_status"] == "PASSED" for rule in rules
+            if rule["source_document"] == INTEL_SOURCE),
     ), flush=True)
     for rule in rules:
         if rule["audit_status"] == "FAILED":
-            print("BuckGPT: rejected document rule from {}: {}".format(
+            print("BuckGPT: rejected rule from {}: {}".format(
                 rule["source_document"], rule["audit_reason"]), flush=True)
     returned_rules = rules if context.get("include_failed_rules", False) else [
         rule for rule in rules if rule["audit_status"] == "PASSED"
@@ -96,9 +108,15 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
     return returned_rules
 
 
+def _sample_rows(df: Any) -> list[dict[str, Any]]:
+    """Send at most 50 existing DataFrame rows to BuckGPT generation."""
+    return [row.asDict(recursive=True) for row in df.limit(50).collect()[:50]]
+
+
 def _build_prompt(
     df: Any, context: dict, reference_paths: list[str],
-    word_documents: list[dict[str, str]]
+    word_documents: list[dict[str, str]],
+    sample_rows: list[dict[str, Any]] | None = None,
 ) -> str:
     schema = [
         {
@@ -120,7 +138,8 @@ def _build_prompt(
     ):
         raise ValueError("context['domain_name'] must be a non-empty string")
     document_names = [os.path.basename(path) for path in reference_paths]
-    allowed_sources = sorted(_allowed_rule_sources(context, reference_paths))
+    allowed_sources = sorted(_allowed_rule_sources(context, reference_paths)
+                             - {INTEL_SOURCE})
 
     return """You are a data-quality rule generator.
 Generate accurate data-quality SQL rules for the DataFrame described below.
@@ -130,6 +149,8 @@ The attached PDFs and Word document text are approved reference context. Use
 all of them when they support a rule. Generate only rules supported by an
 explicit statement in a supplied document or Business context. Do not infer
 rules from the schema or domain alone.
+Use the sample rows to understand how schema columns represent policy concepts.
+Sample values are examples, not policy requirements or proof of uniqueness.
 If a rule is based on a document, identify the relevant policy text in
 reference_context.
 Use the business domain to interpret the terminology and prioritize relevant
@@ -202,6 +223,9 @@ Allowed source_document values (copy one exactly for each rule):
 
 Word document text:
 {word_documents}
+
+Up to 50 sample records:
+{sample_rows}
 """.format(
         placeholder=DATAFRAME_PLACEHOLDER,
         schema=json.dumps(schema, indent=2),
@@ -210,12 +234,61 @@ Word document text:
         documents=json.dumps(document_names),
         sources=json.dumps(allowed_sources),
         word_documents=json.dumps(word_documents, ensure_ascii=False),
+        sample_rows=json.dumps(sample_rows or [], default=str, ensure_ascii=False),
+    )
+
+
+def _build_general_prompt(df: Any, context: dict,
+                          sample_rows: list[dict[str, Any]]) -> str:
+    schema = [{"name": field.name, "type": field.dataType.simpleString(),
+               "nullable": field.nullable} for field in df.schema.fields]
+    return """You are a business data-quality expert. Generate only important,
+defensible general SQL rules for the supplied DataFrame. Choose the number of
+rules based on meaningful checks; there is no target count. Use the business
+domain, schema, and up to 50 sample records to understand the data, but do not
+mistake a sample pattern for a universal contract. Return [] when a rule could
+reject legitimate records.
+
+Consider non-negative checks for amounts or counts where negative values are
+semantically impossible, and meaningful cross-column relationships, including
+multi-column relationships. Also consider uniqueness of a clear business key
+or meaningful combination of key columns. Do not create routine ID null
+checks, duplicate policy rules, or invented thresholds, formats, categories,
+or relationships. Do not infer a uniqueness contract merely because values in
+50 rows differ. Do not require uniqueness of values that can legitimately recur.
+
+Return a JSON array. Each row-level rule must have these string fields: name,
+description, source_document, reference_context, sql. Set source_document to
+"BuckGPT_Intel" and begin reference_context with "BuckGPT_Intel: " followed
+by a short explanation of the business reason for the check. SQL must return
+invalid rows in this form:
+SELECT * FROM {placeholder} WHERE <invalid-row condition>
+Use only the supplied columns. No joins, aggregation, windows, subqueries, or
+additional statements.
+
+For a defensible uniqueness check, instead include check_type "uniqueness",
+columns as an array of the exact key column names, and sql as an empty string.
+Keep name, description, source_document, and reference_context as above.
+The SDK will construct the dataset-level duplicate query from those columns.
+Only propose keys with a strong business identity rationale; sample uniqueness
+alone is insufficient evidence.
+
+Business domain: {domain}
+DataFrame schema: {schema}
+Sample records: {sample_rows}
+""".format(
+        placeholder=DATAFRAME_PLACEHOLDER,
+        domain=context.get("domain_name") or "Not provided",
+        schema=json.dumps(schema, default=str),
+        sample_rows=json.dumps(sample_rows, default=str, ensure_ascii=False),
     )
 
 
 def _generate_and_audit_with_gemini(
     api_key: str, model: str, prompt: str, pdf_paths: list[str],
     allowed_sources: set[str],
+    general_prompt: str | None = None,
+    schema_columns: list[str] | None = None,
 ) -> tuple[str, str]:
     try:
         from google import genai
@@ -239,15 +312,24 @@ def _generate_and_audit_with_gemini(
             for attempt in range(2):
                 generation_prompt = phase_prompt
                 if attempt:
+                    source_guidance = (
+                        "BuckGPT_Intel rules need a reference_context beginning "
+                        "'BuckGPT_Intel: ' with a clear business rationale. "
+                        "Uniqueness checks need check_type 'uniqueness', valid "
+                        "columns, and empty sql; row rules need SELECT SQL. "
+                        if phase_sources == {INTEL_SOURCE} else
+                        "Every rule needs a quoted reference_context from its "
+                        "named document or Business context. "
+                    )
                     generation_prompt += (
                         "\nThe previous response contained no valid rules: {}. "
                         "Try again. Use only these exact source_document values: {}. "
-                        "Every rule needs a quoted reference_context from its "
-                        "named document or Business context. "
-                        "Every rule needs SQL beginning "
-                        "SELECT * FROM {} WHERE. Return [] only if no supported rule exists."
+                        "{}"
+                        "Row rules need SQL beginning SELECT * FROM {} WHERE. "
+                        "Return [] only if no supported rule exists."
                     ).format(", ".join(sorted(set(rejection_reasons))) or "empty response",
-                             json.dumps(sorted(phase_sources)), DATAFRAME_PLACEHOLDER)
+                             json.dumps(sorted(phase_sources)), source_guidance,
+                             DATAFRAME_PLACEHOLDER)
                 response = client.models.generate_content(
                     model=model,
                     contents=[generation_prompt, *files],
@@ -260,7 +342,7 @@ def _generate_and_audit_with_gemini(
                 rejection_reasons = []
                 try:
                     rules = _parse_rules(response_text, phase_sources,
-                                         rejection_reasons)
+                                         rejection_reasons, schema_columns)
                 except ValueError as exc:
                     rejection_reasons.append(str(exc))
                     rules = []
@@ -277,7 +359,7 @@ def _generate_and_audit_with_gemini(
             return [], rejection_reasons
 
         print("BuckGPT: generating rules", flush=True)
-        document_sources = allowed_sources
+        document_sources = allowed_sources - {INTEL_SOURCE}
         document_rules = []
         rejection_reasons = []
         if document_sources:
@@ -310,6 +392,25 @@ def _generate_and_audit_with_gemini(
                 print("BuckGPT: no document-backed rules found", flush=True)
 
         candidate_rules = list(document_rules)
+        if general_prompt and INTEL_SOURCE in allowed_sources:
+            print("BuckGPT: generating general rules", flush=True)
+            general_phase_prompt = general_prompt + (
+                "\nPreviously generated policy rules; do not duplicate them: {}"
+            ).format(json.dumps([
+                {"name": rule["name"], "sql": rule["sql"]}
+                for rule in document_rules
+            ]))
+            general_rules, general_rejections = generate_phase(
+                general_phase_prompt, {INTEL_SOURCE}, [],
+            )
+            rejection_reasons.extend(general_rejections)
+            seen_sql = {rule["sql"].strip().rstrip(";").lower()
+                        for rule in candidate_rules}
+            for rule in general_rules:
+                sql_key = rule["sql"].strip().rstrip(";").lower()
+                if sql_key not in seen_sql:
+                    candidate_rules.append(rule)
+                    seen_sql.add(sql_key)
         if not candidate_rules:
             if not rejection_reasons:
                 return "[]", "[]"
@@ -317,13 +418,16 @@ def _generate_and_audit_with_gemini(
                              .format(", ".join(sorted(set(rejection_reasons)))
                                      or "no rules were returned"))
 
-        print("BuckGPT: generated {} document-backed candidates".format(
-            len(candidate_rules)), flush=True)
+        print("BuckGPT: generated {} document-backed and {} general candidates".format(
+            sum(rule["source_document"] != INTEL_SOURCE for rule in candidate_rules),
+            sum(rule["source_document"] == INTEL_SOURCE for rule in candidate_rules),
+        ), flush=True)
 
         def audit_rules(rules: list[dict[str, str]]) -> str:
             response = client.models.generate_content(
                 model=model,
-                contents=[_build_audit_prompt(prompt, rules), *uploaded_files],
+                contents=[_build_audit_prompt(prompt + "\n" + (general_prompt or ""), rules),
+                          *uploaded_files],
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     response_mime_type="application/json",
@@ -334,7 +438,10 @@ def _generate_and_audit_with_gemini(
         print("BuckGPT: auditing rules", flush=True)
         audit_text = audit_rules(candidate_rules)
         audits = _parse_audit_results(audit_text, len(candidate_rules))
-        document_indices = list(range(1, len(candidate_rules) + 1))
+        document_indices = [
+            index for index, rule in enumerate(candidate_rules, start=1)
+            if rule["source_document"] != INTEL_SOURCE
+        ]
         if document_indices and not any(
             audits.get(index, {}).get("audit_status") == "PASSED"
             for index in document_indices
@@ -368,7 +475,11 @@ def _generate_and_audit_with_gemini(
                 if rule["sql"].strip().rstrip(";").lower() not in rejected_sql
             ]
             if revised_rules:
-                candidate_rules = revised_rules
+                general_candidates = [
+                    rule for rule in candidate_rules
+                    if rule["source_document"] == INTEL_SOURCE
+                ]
+                candidate_rules = revised_rules + general_candidates
                 print("BuckGPT: auditing revised rules", flush=True)
                 audit_text = audit_rules(candidate_rules)
             elif retry_rejections:
@@ -403,13 +514,23 @@ Pass a rule only when all conditions are true:
   description must explain an unambiguous mapping to DataFrame columns, and
   SQL must implement only the specific control in that quote. A broad accuracy
   statement alone does not support a specific SQL check.
-- Its SQL checks exactly the quoted control.
+- A BuckGPT_Intel rule must start reference_context with "BuckGPT_Intel: ".
+  Its rationale must explain a defensible business check grounded in the
+  schema and domain. Sample rows can clarify meaning but cannot establish
+  universal non-negativity, uniqueness, or cross-column requirements alone.
+  Reject speculative constraints and simple ID null checks.
+- A BuckGPT_Intel uniqueness check has check_type "uniqueness", key columns
+  from the schema, and a dataset-level SQL query that returns duplicate key
+  groups. Pass it only when its key has a convincing business identity
+  rationale. Do not infer uniqueness from sample distinctness alone.
+- Its SQL checks exactly the quoted control or general rationale.
 - The SQL uses only the supplied DataFrame columns.
-- The SQL has exactly this form: SELECT * FROM {placeholder} WHERE
-  <invalid-row condition>. It contains no joins, grouping, ordering,
-  subqueries, or additional statements.
+- A row-level rule's SQL has exactly this form: SELECT * FROM {placeholder}
+  WHERE <invalid-row condition>. It contains no joins, grouping, ordering,
+  windows, subqueries, or additional statements. A uniqueness check instead
+  groups by its declared key columns and returns groups with COUNT(*) > 1.
 - The SQL does not invent formats, values, thresholds, or unsupported logic.
-  Column relationships need an explicit reference.
+  Document-backed column relationships need an explicit reference.
 - A "valid" reference has an explicit format, allowed-value list, or validation
   condition; null/empty SQL alone must fail such a rule.
 - A context-aware null/empty SQL check needs a reference that explicitly says
@@ -514,8 +635,18 @@ def _read_docx_text(path: str) -> str:
     return result
 
 
+def _uniqueness_sql(columns: list[str]) -> str:
+    identifiers = ["`{}`".format(column.replace("`", "``")) for column in columns]
+    keys = ", ".join(identifiers)
+    present = " AND ".join("{} IS NOT NULL".format(name) for name in identifiers)
+    return ("SELECT {}, COUNT(*) AS duplicate_count FROM {} WHERE {} "
+            "GROUP BY {} HAVING COUNT(*) > 1").format(
+                keys, DATAFRAME_PLACEHOLDER, present, keys)
+
+
 def _parse_rules(response_text: str, allowed_sources: set[str],
-                 rejection_reasons: list[str] | None = None) -> list[dict[str, str]]:
+                 rejection_reasons: list[str] | None = None,
+                 schema_columns: list[str] | None = None) -> list[dict[str, Any]]:
     try:
         raw_rules = json.loads(_strip_markdown_fence(response_text))
     except json.JSONDecodeError as exc:
@@ -545,6 +676,38 @@ def _parse_rules(response_text: str, allowed_sources: set[str],
         if source_document not in allowed_sources:
             if rejection_reasons is not None:
                 rejection_reasons.append("source_document is not an allowed filename")
+            continue
+        if source_document == INTEL_SOURCE and not reference_context.startswith(
+            INTEL_SOURCE + ": "
+        ):
+            if rejection_reasons is not None:
+                rejection_reasons.append("BuckGPT_Intel rule needs a labeled rationale")
+            continue
+        check_type = raw_rule.get("check_type", "row")
+        if check_type == "uniqueness":
+            columns = raw_rule.get("columns")
+            if (source_document != INTEL_SOURCE or not isinstance(columns, list)
+                    or not columns or schema_columns is None
+                    or any(not isinstance(column, str)
+                           or column not in schema_columns for column in columns)
+                    or len(columns) != len(set(columns))
+                    or sql not in ("", _uniqueness_sql(columns))):
+                if rejection_reasons is not None:
+                    rejection_reasons.append(
+                        "uniqueness check requires BuckGPT_Intel, valid key columns, and canonical sql"
+                    )
+                continue
+            rules.append({
+                "name": name, "description": description,
+                "source_document": source_document,
+                "reference_context": reference_context,
+                "check_type": "uniqueness", "columns": columns,
+                "sql": _uniqueness_sql(columns),
+            })
+            continue
+        if check_type != "row":
+            if rejection_reasons is not None:
+                rejection_reasons.append("unknown check_type")
             continue
         if not re.match(r"^SELECT\b", sql, re.IGNORECASE):
             if rejection_reasons is not None:

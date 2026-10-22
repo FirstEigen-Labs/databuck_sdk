@@ -14,11 +14,13 @@ os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
 
 from databuck.agentic_rules import (
     _build_audit_prompt,
+    _build_general_prompt,
     _build_prompt,
     _get_reference_paths,
     _generate_and_audit_with_gemini,
     _parse_rules,
     _read_docx_text,
+    _sample_rows,
     discover_rules,
     has_rule_reference_context,
 )
@@ -72,6 +74,116 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertIn("Balances must reconcile", prompt)
         self.assertIn("Business domain:\nbanking", _build_audit_prompt(prompt, []))
 
+    def test_fifty_sample_rows_reach_policy_and_general_prompts(self):
+        df = Mock()
+        df.schema.fields = [SimpleNamespace(
+            name="balance", dataType=SimpleNamespace(simpleString=lambda: "double"),
+            nullable=True,
+        )]
+        df.limit.return_value.collect.return_value = [
+            SimpleNamespace(asDict=lambda recursive, number=number: {"balance": number})
+            for number in range(51)
+        ]
+        rows = _sample_rows(df)
+        df.limit.assert_called_once_with(50)
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(rows[-1], {"balance": 49})
+        context = {"domain_name": "banking"}
+        policy = _build_prompt(df, context, [], [], sample_rows=rows)
+        general = _build_general_prompt(df, context, rows)
+        self.assertIn('"balance": 49', policy)
+        self.assertIn('"balance": 49', general)
+        self.assertNotIn('"balance": 50', policy + general)
+        self.assertIn("BuckGPT_Intel", general)
+        self.assertNotIn("BuckGPT_Intel", policy)
+
+    def test_discover_sends_sample_to_both_generation_phases(self):
+        df = Mock()
+        df.schema.fields = [SimpleNamespace(
+            name="balance", dataType=SimpleNamespace(simpleString=lambda: "double"),
+            nullable=True,
+        )]
+        df.limit.return_value.collect.return_value = [
+            SimpleNamespace(asDict=lambda recursive: {"balance": 12.5})
+        ]
+        with patch("databuck.agentic_rules._generate_and_audit_with_gemini",
+                   return_value=("[]", "[]")) as generate, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(discover_rules(df, {
+                "gemini_api_key": "test-key", "domain_name": "banking",
+            }), [])
+        kwargs = generate.call_args.kwargs
+        self.assertIn('"balance": 12.5', kwargs["prompt"])
+        self.assertIn('"balance": 12.5', kwargs["general_prompt"])
+        df.limit.assert_called_once_with(50)
+
+    def test_policy_and_general_candidates_share_audit(self):
+        policy_rule = {
+            "name": "Required balance", "description": "Balance is required.",
+            "source_document": "policy.pdf", "reference_context": "Balance is required.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE balance IS NULL",
+        }
+        general_rule = {
+            "name": "Nonnegative balance", "description": "Balance cannot be negative.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Negative balances are invalid for this data.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE balance < 0",
+        }
+        client = Mock()
+        uploaded = SimpleNamespace(name="uploaded-policy")
+        client.files.upload.return_value = uploaded
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text=json.dumps([policy_rule])),
+            SimpleNamespace(text=json.dumps([general_rule])),
+            SimpleNamespace(text=json.dumps([
+                {"rule_index": i, "audit_status": "PASSED", "audit_reason": "Valid."}
+                for i in (1, 2)
+            ])),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            response_text, _ = _generate_and_audit_with_gemini(
+                "test-key", "test-model", "policy prompt", ["/some/policy.pdf"],
+                {"policy.pdf", "BuckGPT_Intel"},
+                general_prompt="general prompt",
+            )
+        self.assertEqual(json.loads(response_text), [policy_rule, general_rule])
+        calls = client.models.generate_content.call_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0].kwargs["contents"][1:], [uploaded])
+        self.assertEqual(len(calls[1].kwargs["contents"]), 1)
+        self.assertIn('"source_document": "policy.pdf"',
+                      calls[2].kwargs["contents"][0])
+        self.assertIn('"source_document": "BuckGPT_Intel"',
+                      calls[2].kwargs["contents"][0])
+
+    def test_general_uniqueness_uses_dataset_query_and_schema_columns(self):
+        uniqueness = {
+            "name": "Unique loan ID", "description": "One row per loan.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Loan ID identifies a loan record.",
+            "check_type": "uniqueness", "columns": ["loan_id"], "sql": "",
+        }
+        parsed = _parse_rules(json.dumps([uniqueness]), {"BuckGPT_Intel"},
+                              schema_columns=["loan_id", "amount"])
+        self.assertEqual(parsed[0]["sql"],
+                         "SELECT `loan_id`, COUNT(*) AS duplicate_count FROM "
+                         "{{DATAFRAME}} WHERE `loan_id` IS NOT NULL GROUP BY "
+                         "`loan_id` HAVING COUNT(*) > 1")
+        self.assertEqual(_parse_rules(json.dumps(parsed), {"BuckGPT_Intel"},
+                                      schema_columns=["loan_id", "amount"]), parsed)
+        invented = dict(uniqueness, columns=["missing_id"])
+        self.assertEqual(_parse_rules(json.dumps([invented]), {"BuckGPT_Intel"},
+                                      schema_columns=["loan_id", "amount"]), [])
+        policy = dict(uniqueness, source_document="policy.pdf")
+        self.assertEqual(_parse_rules(json.dumps([policy]),
+                                      {"policy.pdf", "BuckGPT_Intel"},
+                                      schema_columns=["loan_id"]), [])
+
     def test_discovered_rule_prints_its_document_source(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "banking_policy.pdf"
@@ -87,7 +199,8 @@ class ReferenceDocumentTests(unittest.TestCase):
                       "audit_reason": "Quote verified in named document."}]
             df = SimpleNamespace(schema=SimpleNamespace(fields=[]))
             output = io.StringIO()
-            with patch("databuck.agentic_rules._generate_and_audit_with_gemini",
+            with patch("databuck.agentic_rules._sample_rows", return_value=[]), \
+                 patch("databuck.agentic_rules._generate_and_audit_with_gemini",
                        return_value=(json.dumps([rule]), json.dumps(audit))) as generate:
                 with contextlib.redirect_stdout(output):
                     rules = discover_rules(df, {
@@ -96,15 +209,15 @@ class ReferenceDocumentTests(unittest.TestCase):
             self.assertEqual(rules[0]["source_document"], path.name)
             self.assertIn("Source document: banking_policy.pdf", output.getvalue())
             self.assertEqual(generate.call_args.kwargs["allowed_sources"],
-                             {path.name})
+                             {path.name, "BuckGPT_Intel"})
             self.assertIn("there is no target count", generate.call_args.kwargs["prompt"])
             self.assertNotIn("rule_count", generate.call_args.kwargs)
 
-    def test_only_document_or_explicit_business_context_sources_are_allowed(self):
+    def test_policy_prompt_excludes_general_source(self):
         df = SimpleNamespace(schema=SimpleNamespace(fields=[]))
         prompt = _build_prompt(df, {"domain_name": "banking"}, [], [])
         self.assertIn("Do not infer\nrules from the schema or domain alone", prompt)
-        self.assertNotIn("BuckGPT_Intel", prompt)
+        self.assertIn('Allowed source_document values (copy one exactly for each rule):\n[]', prompt)
         rule = {
             "name": "Funding consistency", "description": "Funding reconciles.",
             "source_document": "BuckGPT_Intel",
@@ -112,7 +225,7 @@ class ReferenceDocumentTests(unittest.TestCase):
             "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt <> funded_amnt_inv + other_funding",
         }
         self.assertEqual(_parse_rules(json.dumps([rule]), {"policy.pdf"}), [])
-        self.assertFalse(has_rule_reference_context({"domain_name": "banking"}))
+        self.assertTrue(has_rule_reference_context({"domain_name": "banking"}))
 
     def test_rule_with_unknown_document_source_is_rejected(self):
         rule = {
