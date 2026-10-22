@@ -61,6 +61,7 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         {"name": os.path.basename(path), "text": _read_docx_text(path)}
         for path in reference_paths if path.lower().endswith(".docx")
     ]
+    schema_columns = [field.name for field in df.schema.fields]
     prompt = _build_prompt(df, context, rule_count, reference_paths, word_documents)
     response_text, audit_response_text = _generate_and_audit_with_gemini(
         api_key=api_key,
@@ -69,11 +70,14 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         pdf_paths=pdf_paths,
         allowed_sources=allowed_sources,
         rule_count=rule_count,
+        schema_columns=schema_columns,
     )
-    rules = _parse_rules(response_text, allowed_sources)
+    rules = _parse_rules(response_text, allowed_sources,
+                         schema_columns=schema_columns)
 
     if not rules:
-        raise ValueError("Gemini did not return any valid SQL rules")
+        print("BuckGPT: no eligible rules found", flush=True)
+        return []
 
     _apply_audit_results(rules, audit_response_text)
     returned_rules = rules if context.get("include_failed_rules", False) else [
@@ -156,8 +160,8 @@ Reference requirements:
   reference_context with "BuckGPT_Intel: " followed by a brief rationale
   explaining the schema/domain semantics and why the check matters. This is
   an inferred rule, not a policy citation. Do not invent or attribute a quote
-  to a document. Prefer simple, broadly valid
-  invariants over speculative checks; omit a rule when the column meaning is
+  to a document. Prefer meaningful cross-column business relationships over
+  speculative checks; omit a rule when the column meaning is
   ambiguous or the check could reject legitimate records.
 - Never use a full path, URL, section title, an empty value, or an invented
   source_document value.
@@ -171,8 +175,12 @@ Reference requirements:
   rule requires an explicit format, allowed-value list, or validation condition.
 - A context-aware null/empty check is permitted only when the reference
   explicitly says required, present, non-null, non-empty, or mandatory.
-- A general null/empty check needs a clear business necessity beyond the
-  column name; avoid routine completeness checks on technical identifiers.
+- General BuckGPT_Intel rules must express one substantive business
+  relationship across 3 to 5 distinct DataFrame columns. Do not create
+  standalone null/empty, uniqueness, range, format, category, or
+  non-negativity checks. Do not combine independent simple checks with AND/OR
+  just to mention several columns. Null checks may guard a relationship, but
+  guarded columns count only when used in the substantive condition.
 - Look for meaningful intercolumn relationships involving 3 to 5 columns in
   the schema. If one explicit statement defines such a relationship, create
   one rule checking the full relationship across all stated columns. For a
@@ -231,7 +239,8 @@ Word document text:
 
 def _generate_and_audit_with_gemini(
     api_key: str, model: str, prompt: str, pdf_paths: list[str],
-    allowed_sources: set[str], rule_count: int = 25,
+    allowed_sources: set[str], rule_count: int = 30,
+    schema_columns: list[str] | None = None,
 ) -> tuple[str, str]:
     try:
         from google import genai
@@ -275,7 +284,8 @@ def _generate_and_audit_with_gemini(
                 response_text = (response.text or "").strip()
                 rejection_reasons = []
                 try:
-                    rules = _parse_rules(response_text, phase_sources, rejection_reasons)
+                    rules = _parse_rules(response_text, phase_sources,
+                                         rejection_reasons, schema_columns)
                 except ValueError as exc:
                     rejection_reasons.append(str(exc))
                     rules = []
@@ -319,7 +329,9 @@ def _generate_and_audit_with_gemini(
                 "Do not duplicate these document-backed rules: {}. Do not assume "
                 "that ID columns are primary or foreign keys. Do not invent fixed "
                 "categories, date formats, or policy codes. Omit any general rule "
-                "that could reject legitimate records."
+                "that could reject legitimate records. Generate only substantive "
+                "relationships across 3 to 5 columns; no standalone null checks "
+                "or combinations of independent simple checks."
             ).format(remaining, json.dumps([
                 {"name": rule["name"], "sql": rule["sql"]}
                 for rule in document_rules
@@ -338,6 +350,11 @@ def _generate_and_audit_with_gemini(
                 if len(candidate_rules) == rule_count:
                     break
         if not candidate_rules:
+            if not rejection_reasons or all(
+                reason == "BuckGPT_Intel SQL lacks a 3-to-5-column relationship"
+                for reason in rejection_reasons
+            ):
+                return "[]", "[]"
             raise ValueError("Gemini did not return any valid SQL rules after one retry: {}"
                              .format(", ".join(sorted(set(rejection_reasons)))
                                      or "no rules were returned"))
@@ -377,9 +394,12 @@ Pass a rule only when all conditions are true:
   in Business context.
 - A "BuckGPT_Intel" rule has a reference_context beginning "BuckGPT_Intel: "
   and a clear rationale based on the supplied schema and business domain.
-  Treat it as an inferred general
-  rule, never as a document citation. Reject speculative constraints, routine
-  ID completeness checks, or rules that could reject legitimate records.
+  Treat it as an inferred general rule, never as a document citation. Pass it
+  only if its SQL implements one substantive relationship across 3 to 5
+  columns. Reject standalone null/empty, uniqueness, range, format, category,
+  and non-negativity checks, as well as combinations of independent simple
+  checks. Null guards do not count toward the 3 to 5 columns. Reject
+  speculative constraints or rules that could reject legitimate records.
   Do not assume primary/foreign keys from column names. Reject invented
   categorical value lists, date formats, policy codes, data conversions, and
   broad checks combining unrelated columns.
@@ -394,8 +414,7 @@ Pass a rule only when all conditions are true:
 - A "valid" reference has an explicit format, allowed-value list, or validation
   condition; null/empty SQL alone must fail such a rule.
 - A context-aware null/empty SQL check needs a reference that explicitly says
-  required, present, non-null, non-empty, or mandatory. A general null/empty
-  check needs a specific business necessity beyond the column name.
+  required, present, non-null, non-empty, or mandatory.
 
 Fail ambiguous, partly supported, over-broad, or mismatched rules. Explain the
 specific mismatch in audit_reason.
@@ -496,8 +515,41 @@ def _read_docx_text(path: str) -> str:
     return result
 
 
+def _is_complex_general_sql(sql: str, schema_columns: list[str]) -> bool:
+    """Require a 3-to-5-column relationship beyond optional null guards."""
+    parts = re.split(r"\bWHERE\b", sql, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) != 2 or not schema_columns:
+        return False
+
+    # Ignore names inside SQL string literals.
+    condition = re.sub(r"'(?:''|[^'])*'", "''", parts[1])
+    patterns = {
+        name: r"(?<!\w)(?:`{0}`|\"{0}\"|{0})(?!\w)".format(re.escape(name))
+        for name in schema_columns
+    }
+    column = "(?:{})".format("|".join(patterns.values()))
+    substantive = re.sub(
+        column + r"\s+IS\s+(?:NOT\s+)?NULL\b", " ", condition,
+        flags=re.IGNORECASE,
+    )
+    involved = {
+        name for name, pattern in patterns.items()
+        if re.search(pattern, substantive, flags=re.IGNORECASE)
+    }
+    if not 3 <= len(involved) <= 5:
+        return False
+
+    cross_column = re.search(
+        column + r"\s*(?:<=|>=|<>|!=|=|<|>|\+|-|\*|/)\s*" + column,
+        substantive, flags=re.IGNORECASE,
+    )
+    conditional = re.search(r"\bCASE\b", substantive, flags=re.IGNORECASE)
+    return bool(cross_column or conditional)
+
+
 def _parse_rules(response_text: str, allowed_sources: set[str],
-                 rejection_reasons: list[str] | None = None) -> list[dict[str, str]]:
+                 rejection_reasons: list[str] | None = None,
+                 schema_columns: list[str] | None = None) -> list[dict[str, str]]:
     try:
         raw_rules = json.loads(_strip_markdown_fence(response_text))
     except json.JSONDecodeError as exc:
@@ -545,6 +597,11 @@ def _parse_rules(response_text: str, allowed_sources: set[str],
         if re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|DROP|CREATE|ALTER|CALL)\b", sql, re.IGNORECASE):
             if rejection_reasons is not None:
                 rejection_reasons.append("SQL contains a forbidden statement")
+            continue
+        if (source_document == INTEL_SOURCE and schema_columns is not None
+                and not _is_complex_general_sql(sql, schema_columns)):
+            if rejection_reasons is not None:
+                rejection_reasons.append("BuckGPT_Intel SQL lacks a 3-to-5-column relationship")
             continue
 
         rules.append(

@@ -17,6 +17,7 @@ from databuck.agentic_rules import (
     _build_prompt,
     _get_reference_paths,
     _generate_and_audit_with_gemini,
+    _is_complex_general_sql,
     _parse_rules,
     _read_docx_text,
     discover_rules,
@@ -99,7 +100,12 @@ class ReferenceDocumentTests(unittest.TestCase):
             self.assertIn("Generate up to 30", generate.call_args.kwargs["prompt"])
 
     def test_general_rule_uses_intel_source_and_rationale(self):
-        df = SimpleNamespace(schema=SimpleNamespace(fields=[]))
+        columns = ("funded_amnt", "funded_amnt_inv", "other_funding")
+        df = SimpleNamespace(schema=SimpleNamespace(fields=[
+            SimpleNamespace(name=name, dataType=SimpleNamespace(
+                simpleString=lambda: "double"), nullable=True)
+            for name in columns
+        ]))
         prompt = _build_prompt(df, {"domain_name": "banking"}, 10, [], [])
         self.assertIn('source_document to "BuckGPT_Intel"', prompt)
         self.assertIn('relationships involving 3 to 5 columns', prompt)
@@ -109,11 +115,11 @@ class ReferenceDocumentTests(unittest.TestCase):
             "name": "Funding consistency",
             "description": "Investor funding cannot exceed total funding.",
             "source_document": "BuckGPT_Intel",
-            "reference_context": "BuckGPT_Intel: Investor-funded amount is a component of the total funded amount.",
-            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt_inv > funded_amnt",
+            "reference_context": "BuckGPT_Intel: Total funding is the sum of investor and other funding.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt <> funded_amnt_inv + other_funding",
         }
         audit = [{"rule_index": 1, "audit_status": "PASSED",
-                  "audit_reason": "The two funding columns support this relationship."}]
+                  "audit_reason": "The funding columns support this relationship."}]
         with patch("databuck.agentic_rules._generate_and_audit_with_gemini",
                    return_value=(json.dumps([rule]), json.dumps(audit))):
             with contextlib.redirect_stdout(io.StringIO()):
@@ -123,6 +129,19 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertEqual(rules[0]["reference_context"], rule["reference_context"])
         unlabeled = dict(rule, reference_context="Investor funding is part of total funding.")
         self.assertEqual(_parse_rules(json.dumps([unlabeled]), {"BuckGPT_Intel"}), [])
+        simple = dict(rule, sql="SELECT * FROM {{DATAFRAME}} WHERE funded_amnt IS NULL")
+        self.assertEqual(_parse_rules(json.dumps([simple]), {"BuckGPT_Intel"},
+                                      schema_columns=list(columns)), [])
+        document_simple = dict(simple, source_document="policy.pdf",
+                               reference_context="Funded amount is required.")
+        self.assertEqual(_parse_rules(json.dumps([document_simple, simple]),
+                                      {"policy.pdf", "BuckGPT_Intel"},
+                                      schema_columns=list(columns)), [document_simple])
+        self.assertTrue(_is_complex_general_sql(rule["sql"], list(columns)))
+        self.assertFalse(_is_complex_general_sql(
+            "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt < 0 OR "
+            "funded_amnt_inv < 0 OR other_funding < 0", list(columns),
+        ))
 
     def test_rule_with_unknown_document_source_is_rejected(self):
         rule = {
@@ -240,6 +259,32 @@ class ReferenceDocumentTests(unittest.TestCase):
                     {"policy.docx", "BuckGPT_Intel"}, rule_count=2,
                 )
         self.assertEqual(json.loads(response_text), [general_rule])
+
+    def test_simple_general_rules_do_not_trigger_audit(self):
+        simple = {
+            "name": "Required amount", "description": "Amount is present.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Amount is needed.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt IS NULL",
+        }
+        client = Mock()
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text=json.dumps([simple])),
+            SimpleNamespace(text=json.dumps([simple])),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            response_text, audit_text = _generate_and_audit_with_gemini(
+                "test-key", "test-model", "prompt", [], {"BuckGPT_Intel"},
+                schema_columns=["funded_amnt", "funded_amnt_inv", "other_funding"],
+            )
+        self.assertEqual(response_text, "[]")
+        self.assertEqual(audit_text, "[]")
+        self.assertEqual(client.models.generate_content.call_count, 2)
 
 
 if __name__ == "__main__":
