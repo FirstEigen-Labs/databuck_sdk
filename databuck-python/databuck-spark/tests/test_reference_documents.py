@@ -242,6 +242,7 @@ class ReferenceDocumentTests(unittest.TestCase):
         client = Mock()
         client.models.generate_content.side_effect = [
             SimpleNamespace(text="[]"),
+            SimpleNamespace(text="[]"),
             SimpleNamespace(text=json.dumps([general_rule])),
             SimpleNamespace(text=json.dumps([{
                 "rule_index": 1, "audit_status": "PASSED", "audit_reason": "Valid.",
@@ -259,6 +260,9 @@ class ReferenceDocumentTests(unittest.TestCase):
                     {"policy.docx", "BuckGPT_Intel"}, rule_count=2,
                 )
         self.assertEqual(json.loads(response_text), [general_rule])
+        self.assertIn("review each reference again",
+                      client.models.generate_content.call_args_list[1]
+                      .kwargs["contents"][0])
 
     def test_simple_general_rules_do_not_trigger_audit(self):
         simple = {

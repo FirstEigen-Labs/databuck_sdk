@@ -80,6 +80,16 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         return []
 
     _apply_audit_results(rules, audit_response_text)
+    document_rules = [rule for rule in rules if rule["source_document"] != INTEL_SOURCE]
+    general_rules = [rule for rule in rules if rule["source_document"] == INTEL_SOURCE]
+    print("BuckGPT: audit passed {} document-backed and {} general rules".format(
+        sum(rule["audit_status"] == "PASSED" for rule in document_rules),
+        sum(rule["audit_status"] == "PASSED" for rule in general_rules),
+    ), flush=True)
+    for rule in document_rules:
+        if rule["audit_status"] == "FAILED":
+            print("BuckGPT: rejected document rule from {}: {}".format(
+                rule["source_document"], rule["audit_reason"]), flush=True)
     returned_rules = rules if context.get("include_failed_rules", False) else [
         rule for rule in rules if rule["audit_status"] == "PASSED"
     ]
@@ -156,6 +166,10 @@ Reference requirements:
   statement. Do not paraphrase, combine statements, or claim a nonexistent
   reference. source_document must be the exact filename containing the quote,
   or "business_context" for a quote from the Business context block.
+- A policy may name a business concept rather than a DataFrame column. Map the
+  concept to schema columns only when the meaning is unambiguous, and explain
+  that mapping in description. The quote must still state a specific control;
+  a generic call for accuracy does not justify an arbitrary SQL check.
 - For a general rule, set source_document to "BuckGPT_Intel" and begin
   reference_context with "BuckGPT_Intel: " followed by a brief rationale
   explaining the schema/domain semantics and why the check matters. This is
@@ -258,7 +272,8 @@ def _generate_and_audit_with_gemini(
             uploaded_files.append(client.files.upload(file=pdf_path))
 
         def generate_phase(phase_prompt: str, phase_sources: set[str],
-                           files: list[Any]) -> tuple[list[dict[str, str]], list[str]]:
+                           files: list[Any], retry_on_empty: bool = False,
+                           ) -> tuple[list[dict[str, str]], list[str]]:
             rejection_reasons = []
             for attempt in range(2):
                 generation_prompt = phase_prompt
@@ -292,6 +307,12 @@ def _generate_and_audit_with_gemini(
                 if rules:
                     return rules, []
                 if _strip_markdown_fence(response_text) == "[]":
+                    if retry_on_empty and attempt == 0:
+                        rejection_reasons = [
+                            "no document-backed rule identified; review each reference "
+                            "again for an explicit control relevant to the schema"
+                        ]
+                        continue
                     return [], []
             return [], rejection_reasons
 
@@ -303,13 +324,17 @@ def _generate_and_audit_with_gemini(
             document_prompt = prompt + (
                 "\nDocument-backed phase: review every attached PDF, Word document, "
                 "and Business context statement for executable controls involving "
-                "the DataFrame schema. Return only rules supported by an exact quote "
+                "the DataFrame schema. A policy need not use the exact DataFrame "
+                "column names: map its business concepts to columns when the match "
+                "is unambiguous, and explain the mapping in description. Return "
+                "only rules supported by an exact quote "
                 "from these sources: {}. Do not return BuckGPT_Intel rules in this "
                 "phase. Return [] only if none of the references supports a valid "
                 "rule. Return at most {} rules."
             ).format(json.dumps(sorted(document_sources)), rule_count)
             document_rules, rejection_reasons = generate_phase(
                 document_prompt, document_sources, uploaded_files,
+                retry_on_empty=True,
             )
             if rejection_reasons:
                 raise ValueError(
@@ -359,6 +384,11 @@ def _generate_and_audit_with_gemini(
                              .format(", ".join(sorted(set(rejection_reasons)))
                                      or "no rules were returned"))
 
+        print("BuckGPT: generated {} document-backed and {} general candidates".format(
+            sum(rule["source_document"] != INTEL_SOURCE for rule in candidate_rules),
+            sum(rule["source_document"] == INTEL_SOURCE for rule in candidate_rules),
+        ), flush=True)
+
         print("BuckGPT: auditing rules", flush=True)
         audit_response = client.models.generate_content(
             model=model,
@@ -392,6 +422,10 @@ Pass a rule only when all conditions are true:
   statement in its named source_document. The filename must identify the
   document containing the quote; "business_context" must identify a statement
   in Business context.
+- The document quote may use business concepts rather than column names. The
+  description must explain an unambiguous mapping to DataFrame columns, and
+  SQL must implement only the specific control in that quote. A broad accuracy
+  statement alone does not support a specific SQL check.
 - A "BuckGPT_Intel" rule has a reference_context beginning "BuckGPT_Intel: "
   and a clear rationale based on the supplied schema and business domain.
   Treat it as an inferred general rule, never as a document citation. Pass it
