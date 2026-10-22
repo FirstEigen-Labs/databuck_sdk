@@ -44,7 +44,7 @@ class ReferenceDocumentTests(unittest.TestCase):
             self.assertEqual(contents, "Subscriber ID is required.\nAccount ID is required.")
             df = SimpleNamespace(schema=SimpleNamespace(fields=[]))
             prompt = _build_prompt(
-                df, {"pdf_paths": [str(path)]}, 10, [str(path)],
+                df, {"pdf_paths": [str(path)]}, [str(path)],
                 [{"name": path.name, "text": contents}],
             )
             self.assertIn("Account ID is required.", prompt)
@@ -65,7 +65,7 @@ class ReferenceDocumentTests(unittest.TestCase):
         prompt = _build_prompt(
             df,
             {"domain_name": "banking", "business_context": "Balances must reconcile"},
-            10, [], [],
+            [], [],
         )
         self.assertIn("Business domain:\nbanking", prompt)
         self.assertIn("domain name alone is not a policy statement", prompt)
@@ -97,7 +97,8 @@ class ReferenceDocumentTests(unittest.TestCase):
             self.assertIn("Source document: banking_policy.pdf", output.getvalue())
             self.assertEqual(generate.call_args.kwargs["allowed_sources"],
                              {path.name, "BuckGPT_Intel"})
-            self.assertIn("Generate up to 30", generate.call_args.kwargs["prompt"])
+            self.assertIn("there is no target count", generate.call_args.kwargs["prompt"])
+            self.assertNotIn("rule_count", generate.call_args.kwargs)
 
     def test_general_rule_uses_intel_source_and_rationale(self):
         columns = ("funded_amnt", "funded_amnt_inv", "other_funding")
@@ -106,7 +107,7 @@ class ReferenceDocumentTests(unittest.TestCase):
                 simpleString=lambda: "double"), nullable=True)
             for name in columns
         ]))
-        prompt = _build_prompt(df, {"domain_name": "banking"}, 10, [], [])
+        prompt = _build_prompt(df, {"domain_name": "banking"}, [], [])
         self.assertIn('source_document to "BuckGPT_Intel"', prompt)
         self.assertIn('relationships involving 3 to 5 columns', prompt)
         self.assertIn('"BuckGPT_Intel" rule has a reference_context beginning',
@@ -178,7 +179,6 @@ class ReferenceDocumentTests(unittest.TestCase):
         with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
             response_text, audit_text = _generate_and_audit_with_gemini(
                 "test-key", "test-model", "prompt", [], {"policy.pdf"},
-                rule_count=1,
             )
         self.assertEqual(json.loads(response_text), [rule])
         self.assertEqual(json.loads(audit_text), audit)
@@ -219,7 +219,7 @@ class ReferenceDocumentTests(unittest.TestCase):
         with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
             response_text, _ = _generate_and_audit_with_gemini(
                 "test-key", "test-model", "prompt", ["/some/policy.pdf"],
-                {"policy.pdf", "BuckGPT_Intel"}, rule_count=2,
+                {"policy.pdf", "BuckGPT_Intel"},
             )
         self.assertEqual(json.loads(response_text), [document_rule, general_rule])
         calls = client.models.generate_content.call_args_list
@@ -231,6 +231,52 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertEqual(len(calls[1].kwargs["contents"]), 1)
         self.assertEqual(calls[2].kwargs["contents"][1:], [uploaded_file])
         client.files.delete.assert_called_once_with(name="uploaded-policy")
+
+    def test_all_pdfs_share_one_policy_generation_call(self):
+        policy_rules = [
+            {
+                "name": "Rule " + source,
+                "description": "A supported control.",
+                "source_document": source,
+                "reference_context": "The supporting policy statement.",
+                "sql": "SELECT * FROM {{DATAFRAME}} WHERE " + column + " IS NULL",
+            }
+            for source, column in (("a.pdf", "account_id"), ("b.pdf", "member_id"))
+        ]
+        general_rule = {
+            "name": "Funding reconciliation", "description": "Funding components reconcile.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Funding components reconcile.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt <> "
+                   "funded_amnt_inv + other_funding",
+        }
+        client = Mock()
+        uploaded = [SimpleNamespace(name="uploaded-a"), SimpleNamespace(name="uploaded-b")]
+        client.files.upload.side_effect = uploaded
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text=json.dumps(policy_rules)),
+            SimpleNamespace(text=json.dumps([general_rule])),
+            SimpleNamespace(text=json.dumps([
+                {"rule_index": index, "audit_status": "PASSED",
+                 "audit_reason": "Valid."} for index in (1, 2, 3)
+            ])),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            response_text, _ = _generate_and_audit_with_gemini(
+                "test-key", "test-model", "prompt", ["/some/a.pdf", "/some/b.pdf"],
+                {"a.pdf", "b.pdf", "BuckGPT_Intel"},
+            )
+        self.assertEqual(json.loads(response_text), [*policy_rules, general_rule])
+        calls = client.models.generate_content.call_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0].kwargs["contents"][1:], uploaded)
+        self.assertEqual(len(calls[1].kwargs["contents"]), 1)
+        self.assertEqual(calls[2].kwargs["contents"][1:], uploaded)
 
     def test_empty_document_phase_can_still_generate_general_rules(self):
         general_rule = {
@@ -257,12 +303,69 @@ class ReferenceDocumentTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 response_text, _ = _generate_and_audit_with_gemini(
                     "test-key", "test-model", "prompt", [],
-                    {"policy.docx", "BuckGPT_Intel"}, rule_count=2,
+                    {"policy.docx", "BuckGPT_Intel"},
                 )
         self.assertEqual(json.loads(response_text), [general_rule])
         self.assertIn("review each reference again",
                       client.models.generate_content.call_args_list[1]
                       .kwargs["contents"][0])
+
+    def test_failed_document_audit_retries_with_reason_and_reaudits(self):
+        rejected_rule = {
+            "name": "Installment positive", "description": "Installment is positive.",
+            "source_document": "til.pdf",
+            "reference_context": "The APR is a function of the payment schedule.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE installment <= 0",
+        }
+        revised_rule = {
+            "name": "Funding reconciliation", "description": "Funding components reconcile.",
+            "source_document": "til.pdf",
+            "reference_context": "Total funding equals investor and other funding.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt <> funded_amnt_inv + other_funding",
+        }
+        general_rule = {
+            "name": "Payment reconciliation", "description": "Payment components reconcile.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Payment components total the payment.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE total_pymnt <> "
+                   "total_rec_prncp + total_rec_int",
+        }
+        first_audit = [
+            {"rule_index": 1, "audit_status": "FAILED",
+             "audit_reason": "APR quote does not require positive installments."},
+            {"rule_index": 2, "audit_status": "PASSED", "audit_reason": "Valid."},
+        ]
+        second_audit = [
+            {"rule_index": index, "audit_status": "PASSED", "audit_reason": "Valid."}
+            for index in (1, 2)
+        ]
+        client = Mock()
+        uploaded_file = SimpleNamespace(name="uploaded-til")
+        client.files.upload.return_value = uploaded_file
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text=json.dumps([rejected_rule])),
+            SimpleNamespace(text=json.dumps([general_rule])),
+            SimpleNamespace(text=json.dumps(first_audit)),
+            SimpleNamespace(text=json.dumps([revised_rule])),
+            SimpleNamespace(text=json.dumps(second_audit)),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            response_text, audit_text = _generate_and_audit_with_gemini(
+                "test-key", "test-model", "prompt", ["/some/til.pdf"],
+                {"til.pdf", "BuckGPT_Intel"},
+            )
+        self.assertEqual(json.loads(response_text), [revised_rule, general_rule])
+        self.assertEqual(json.loads(audit_text), second_audit)
+        calls = client.models.generate_content.call_args_list
+        self.assertEqual(len(calls), 5)
+        self.assertIn("APR quote does not require positive installments.",
+                      calls[3].kwargs["contents"][0])
+        self.assertEqual(calls[3].kwargs["contents"][1:], [uploaded_file])
 
     def test_simple_general_rules_do_not_trigger_audit(self):
         simple = {

@@ -165,6 +165,10 @@ The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
 notebook driver. PDF files are uploaded to Gemini; text from Word documents is
 extracted locally and included in the generation and audit prompts. Images or
 scanned pages in a Word document are not read.
+BuckGPT attaches all supplied PDFs to one document-backed generation request,
+then generates complex general rules in a separate request. It chooses the
+number of rules from the supported policy controls and meaningful 3-to-5-column
+relationships; `rule_count` is no longer needed.
 
 To export only automatic profiling rules, omit `context`:
 

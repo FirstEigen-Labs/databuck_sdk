@@ -50,10 +50,6 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
             "or the GEMINI_API_KEY environment variable."
         )
 
-    rule_count = int(context.get("rule_count", 30))
-    if rule_count < 1 or rule_count > 50:
-        raise ValueError("context['rule_count'] must be between 1 and 50")
-
     reference_paths = _get_reference_paths(context)
     allowed_sources = _allowed_rule_sources(context, reference_paths)
     pdf_paths = [path for path in reference_paths if path.lower().endswith(".pdf")]
@@ -62,14 +58,13 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         for path in reference_paths if path.lower().endswith(".docx")
     ]
     schema_columns = [field.name for field in df.schema.fields]
-    prompt = _build_prompt(df, context, rule_count, reference_paths, word_documents)
+    prompt = _build_prompt(df, context, reference_paths, word_documents)
     response_text, audit_response_text = _generate_and_audit_with_gemini(
         api_key=api_key,
         model=context.get("gemini_model", DEFAULT_MODEL),
         prompt=prompt,
         pdf_paths=pdf_paths,
         allowed_sources=allowed_sources,
-        rule_count=rule_count,
         schema_columns=schema_columns,
     )
     rules = _parse_rules(response_text, allowed_sources,
@@ -110,7 +105,7 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
 
 
 def _build_prompt(
-    df: Any, context: dict, rule_count: int, reference_paths: list[str],
+    df: Any, context: dict, reference_paths: list[str],
     word_documents: list[dict[str, str]]
 ) -> str:
     schema = [
@@ -136,16 +131,14 @@ def _build_prompt(
     allowed_sources = sorted(_allowed_rule_sources(context, reference_paths))
 
     return """You are a data-quality rule generator.
-Generate up to {rule_count} accurate data-quality SQL rules for the DataFrame
-described below. It is acceptable to return fewer rules when few checks are
-well supported by the supplied context, schema, and domain.
+Generate accurate data-quality SQL rules for the DataFrame described below.
+Choose the number of rules based on the distinct, well-supported checks you
+find; there is no target count. Omit redundant or weak rules.
 The attached PDFs and Word document text are approved reference context. Use
-them when they support a rule. Also create a few general data-quality rules
-when the schema and business domain make their checks genuinely useful and
+all of them when they support a rule. Also create general data-quality rules
+when the schema and business domain make their checks critical and
 their invalid-row conditions are unambiguous. Do not create generic rules
-merely to fill the rule count or duplicate a more specific context-aware rule.
-Prioritize supported context-aware controls, then use remaining capacity for
-the most useful general rules.
+merely to increase the rule count or duplicate a context-aware rule.
 If a rule is based on a document, identify the relevant policy text in
 reference_context.
 Use the business domain to interpret the terminology and prioritize relevant
@@ -240,7 +233,6 @@ Allowed source_document values (copy one exactly for each rule):
 Word document text:
 {word_documents}
 """.format(
-        rule_count=rule_count,
         placeholder=DATAFRAME_PLACEHOLDER,
         schema=json.dumps(schema, indent=2),
         domain_name=domain_name.strip() if domain_name is not None else "Not provided",
@@ -253,7 +245,7 @@ Word document text:
 
 def _generate_and_audit_with_gemini(
     api_key: str, model: str, prompt: str, pdf_paths: list[str],
-    allowed_sources: set[str], rule_count: int = 30,
+    allowed_sources: set[str],
     schema_columns: list[str] | None = None,
 ) -> tuple[str, str]:
     try:
@@ -322,42 +314,49 @@ def _generate_and_audit_with_gemini(
         rejection_reasons = []
         if document_sources:
             document_prompt = prompt + (
-                "\nDocument-backed phase: review every attached PDF, Word document, "
-                "and Business context statement for executable controls involving "
+                "\nDocument-backed phase: review every attached PDF and all "
+                "supplied Word document text together in this request for "
+                "distinct executable controls involving "
                 "the DataFrame schema. A policy need not use the exact DataFrame "
                 "column names: map its business concepts to columns when the match "
                 "is unambiguous, and explain the mapping in description. Return "
-                "only rules supported by an exact quote "
-                "from these sources: {}. Do not return BuckGPT_Intel rules in this "
+                "only rules supported by an exact quote from a supplied document "
+                "or Business context statement. Use its exact filename as "
+                "source_document, or business_context for an explicit statement "
+                "there. Do not "
+                "return BuckGPT_Intel rules in this "
                 "phase. Return [] only if none of the references supports a valid "
-                "rule. Return at most {} rules."
-            ).format(json.dumps(sorted(document_sources)), rule_count)
-            document_rules, rejection_reasons = generate_phase(
+                "rule. Return every distinct, directly supported rule that "
+                "applies to this schema; choose the number yourself."
+            )
+            generated_rules, source_rejections = generate_phase(
                 document_prompt, document_sources, uploaded_files,
                 retry_on_empty=True,
             )
-            if rejection_reasons:
-                raise ValueError(
-                    "Gemini did not return valid document-backed SQL rules after one "
-                    "retry: {}".format(", ".join(sorted(set(rejection_reasons))))
-                )
-            document_rules = document_rules[:rule_count]
+            rejection_reasons.extend(source_rejections)
+            seen_sql = set()
+            for rule in generated_rules:
+                sql_key = rule["sql"].strip().rstrip(";").lower()
+                if sql_key not in seen_sql:
+                    document_rules.append(rule)
+                    seen_sql.add(sql_key)
             if not document_rules:
                 print("BuckGPT: no document-backed rules found", flush=True)
 
         candidate_rules = list(document_rules)
-        remaining = rule_count - len(candidate_rules)
-        if remaining:
+        if INTEL_SOURCE in allowed_sources:
             general_prompt = prompt + (
-                "\nGeneral-rule phase: return only BuckGPT_Intel rules, at most {}. "
+                "\nGeneral-rule phase: return only BuckGPT_Intel rules. "
                 "Do not cite the documents or business context in this phase. "
                 "Do not duplicate these document-backed rules: {}. Do not assume "
                 "that ID columns are primary or foreign keys. Do not invent fixed "
-                "categories, date formats, or policy codes. Omit any general rule "
-                "that could reject legitimate records. Generate only substantive "
+                "categories, date formats, or policy codes. Generate only "
+                "business-critical rules that cannot reasonably reject legitimate "
+                "records. Generate only substantive "
                 "relationships across 3 to 5 columns; no standalone null checks "
-                "or combinations of independent simple checks."
-            ).format(remaining, json.dumps([
+                "or combinations of independent simple checks. Decide the count "
+                "from the meaningful relationships available; return [] if none."
+            ).format(json.dumps([
                 {"name": rule["name"], "sql": rule["sql"]}
                 for rule in document_rules
             ]))
@@ -372,8 +371,6 @@ def _generate_and_audit_with_gemini(
                 if sql_key not in existing_sql:
                     candidate_rules.append(rule)
                     existing_sql.add(sql_key)
-                if len(candidate_rules) == rule_count:
-                    break
         if not candidate_rules:
             if not rejection_reasons or all(
                 reason == "BuckGPT_Intel SQL lacks a 3-to-5-column relationship"
@@ -389,16 +386,69 @@ def _generate_and_audit_with_gemini(
             sum(rule["source_document"] == INTEL_SOURCE for rule in candidate_rules),
         ), flush=True)
 
+        def audit_rules(rules: list[dict[str, str]]) -> str:
+            response = client.models.generate_content(
+                model=model,
+                contents=[_build_audit_prompt(prompt, rules), *uploaded_files],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                ),
+            )
+            return (response.text or "").strip()
+
         print("BuckGPT: auditing rules", flush=True)
-        audit_response = client.models.generate_content(
-            model=model,
-            contents=[_build_audit_prompt(prompt, candidate_rules), *uploaded_files],
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
-        )
-        return json.dumps(candidate_rules), (audit_response.text or "").strip()
+        audit_text = audit_rules(candidate_rules)
+        audits = _parse_audit_results(audit_text, len(candidate_rules))
+        document_indices = [
+            index for index, rule in enumerate(candidate_rules, start=1)
+            if rule["source_document"] != INTEL_SOURCE
+        ]
+        if document_indices and not any(
+            audits.get(index, {}).get("audit_status") == "PASSED"
+            for index in document_indices
+        ):
+            feedback = [
+                "{}: {}".format(
+                    candidate_rules[index - 1]["source_document"],
+                    audits.get(index, {}).get(
+                        "audit_reason", "Auditor returned no valid result."
+                    ),
+                )
+                for index in document_indices
+            ]
+            print("BuckGPT: retrying document rules after audit rejection", flush=True)
+            retry_prompt = document_prompt + (
+                "\nThe previous document-backed candidates all failed audit: {}. "
+                "Find different, directly supported controls in the supplied "
+                "documents. Do not repeat the rejected SQL or infer a positivity, "
+                "non-null, or threshold condition from a broad description. "
+                "Return [] if no specific executable control is supported."
+            ).format(json.dumps(feedback))
+            revised_rules, retry_rejections = generate_phase(
+                retry_prompt, document_sources, uploaded_files,
+            )
+            rejected_sql = {
+                candidate_rules[index - 1]["sql"].strip().rstrip(";").lower()
+                for index in document_indices
+            }
+            revised_rules = [
+                rule for rule in revised_rules
+                if rule["sql"].strip().rstrip(";").lower() not in rejected_sql
+            ]
+            if revised_rules:
+                general_candidates = [
+                    rule for rule in candidate_rules
+                    if rule["source_document"] == INTEL_SOURCE
+                ]
+                candidate_rules = revised_rules + general_candidates
+                print("BuckGPT: auditing revised rules", flush=True)
+                audit_text = audit_rules(candidate_rules)
+            elif retry_rejections:
+                print("BuckGPT: document retry returned no valid rules: {}".format(
+                    ", ".join(sorted(set(retry_rejections))),
+                ), flush=True)
+        return json.dumps(candidate_rules), audit_text
     finally:
         # The PDFs are needed only for this single rule-generation request.
         for uploaded_file in uploaded_files:
