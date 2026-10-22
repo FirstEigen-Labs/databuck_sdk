@@ -50,7 +50,7 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
             "or the GEMINI_API_KEY environment variable."
         )
 
-    rule_count = int(context.get("rule_count", 25))
+    rule_count = int(context.get("rule_count", 30))
     if rule_count < 1 or rule_count > 50:
         raise ValueError("context['rule_count'] must be between 1 and 50")
 
@@ -68,6 +68,7 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         prompt=prompt,
         pdf_paths=pdf_paths,
         allowed_sources=allowed_sources,
+        rule_count=rule_count,
     )
     rules = _parse_rules(response_text, allowed_sources)
 
@@ -162,7 +163,10 @@ Reference requirements:
   source_document value.
 - Do not infer ID patterns, allowed values, thresholds, statuses, or business
   relationships from a column name alone. Do not assert that an ID must be
-  non-null merely because its name ends in ID.
+  non-null or is a primary/foreign key merely because its name ends in ID.
+- General rules must not invent categorical value lists, string date formats,
+  policy codes, or data conversions. Do not combine unrelated columns into a
+  broad rule merely because their names sound similar.
 - Do not downgrade a "valid" requirement into a null/empty check. A validity
   rule requires an explicit format, allowed-value list, or validation condition.
 - A context-aware null/empty check is permitted only when the reference
@@ -227,7 +231,7 @@ Word document text:
 
 def _generate_and_audit_with_gemini(
     api_key: str, model: str, prompt: str, pdf_paths: list[str],
-    allowed_sources: set[str],
+    allowed_sources: set[str], rule_count: int = 25,
 ) -> tuple[str, str]:
     try:
         from google import genai
@@ -244,40 +248,95 @@ def _generate_and_audit_with_gemini(
         for pdf_path in pdf_paths:
             uploaded_files.append(client.files.upload(file=pdf_path))
 
-        print("BuckGPT: generating rules", flush=True)
-        candidate_rules = []
-        rejection_reasons = []
-        for attempt in range(2):
-            generation_prompt = prompt
-            if attempt:
-                generation_prompt += (
-                    "\nThe previous response contained no valid rules: {}. "
-                    "Try again. Use only these exact source_document values: {}. "
-                    "Context-aware rules need a quoted reference_context; "
-                    "BuckGPT_Intel rules need reference_context starting "
-                    "'BuckGPT_Intel: ' followed by a clear general rationale. "
-                    "Every rule needs SQL beginning "
-                    "SELECT * FROM {} WHERE. Return [] only if no supported rule exists."
-                ).format(", ".join(sorted(set(rejection_reasons))) or "empty response",
-                         json.dumps(sorted(allowed_sources)), DATAFRAME_PLACEHOLDER)
-            response = client.models.generate_content(
-                model=model,
-                contents=[generation_prompt, *uploaded_files],
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                ),
-            )
-            candidate_response_text = (response.text or "").strip()
+        def generate_phase(phase_prompt: str, phase_sources: set[str],
+                           files: list[Any]) -> tuple[list[dict[str, str]], list[str]]:
             rejection_reasons = []
-            try:
-                candidate_rules = _parse_rules(candidate_response_text, allowed_sources,
-                                               rejection_reasons)
-            except ValueError as exc:
-                rejection_reasons.append(str(exc))
-                candidate_rules = []
-            if candidate_rules:
-                break
+            for attempt in range(2):
+                generation_prompt = phase_prompt
+                if attempt:
+                    generation_prompt += (
+                        "\nThe previous response contained no valid rules: {}. "
+                        "Try again. Use only these exact source_document values: {}. "
+                        "Context-aware rules need a quoted reference_context; "
+                        "BuckGPT_Intel rules need reference_context starting "
+                        "'BuckGPT_Intel: ' followed by a clear general rationale. "
+                        "Every rule needs SQL beginning "
+                        "SELECT * FROM {} WHERE. Return [] only if no supported rule exists."
+                    ).format(", ".join(sorted(set(rejection_reasons))) or "empty response",
+                             json.dumps(sorted(phase_sources)), DATAFRAME_PLACEHOLDER)
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[generation_prompt, *files],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                )
+                response_text = (response.text or "").strip()
+                rejection_reasons = []
+                try:
+                    rules = _parse_rules(response_text, phase_sources, rejection_reasons)
+                except ValueError as exc:
+                    rejection_reasons.append(str(exc))
+                    rules = []
+                if rules:
+                    return rules, []
+                if _strip_markdown_fence(response_text) == "[]":
+                    return [], []
+            return [], rejection_reasons
+
+        print("BuckGPT: generating rules", flush=True)
+        document_sources = allowed_sources - {INTEL_SOURCE}
+        document_rules = []
+        rejection_reasons = []
+        if document_sources:
+            document_prompt = prompt + (
+                "\nDocument-backed phase: review every attached PDF, Word document, "
+                "and Business context statement for executable controls involving "
+                "the DataFrame schema. Return only rules supported by an exact quote "
+                "from these sources: {}. Do not return BuckGPT_Intel rules in this "
+                "phase. Return [] only if none of the references supports a valid "
+                "rule. Return at most {} rules."
+            ).format(json.dumps(sorted(document_sources)), rule_count)
+            document_rules, rejection_reasons = generate_phase(
+                document_prompt, document_sources, uploaded_files,
+            )
+            if rejection_reasons:
+                raise ValueError(
+                    "Gemini did not return valid document-backed SQL rules after one "
+                    "retry: {}".format(", ".join(sorted(set(rejection_reasons))))
+                )
+            document_rules = document_rules[:rule_count]
+            if not document_rules:
+                print("BuckGPT: no document-backed rules found", flush=True)
+
+        candidate_rules = list(document_rules)
+        remaining = rule_count - len(candidate_rules)
+        if remaining:
+            general_prompt = prompt + (
+                "\nGeneral-rule phase: return only BuckGPT_Intel rules, at most {}. "
+                "Do not cite the documents or business context in this phase. "
+                "Do not duplicate these document-backed rules: {}. Do not assume "
+                "that ID columns are primary or foreign keys. Do not invent fixed "
+                "categories, date formats, or policy codes. Omit any general rule "
+                "that could reject legitimate records."
+            ).format(remaining, json.dumps([
+                {"name": rule["name"], "sql": rule["sql"]}
+                for rule in document_rules
+            ]))
+            general_rules, general_rejections = generate_phase(
+                general_prompt, {INTEL_SOURCE}, [],
+            )
+            rejection_reasons.extend(general_rejections)
+            existing_sql = {rule["sql"].strip().rstrip(";").lower()
+                            for rule in candidate_rules}
+            for rule in general_rules:
+                sql_key = rule["sql"].strip().rstrip(";").lower()
+                if sql_key not in existing_sql:
+                    candidate_rules.append(rule)
+                    existing_sql.add(sql_key)
+                if len(candidate_rules) == rule_count:
+                    break
         if not candidate_rules:
             raise ValueError("Gemini did not return any valid SQL rules after one retry: {}"
                              .format(", ".join(sorted(set(rejection_reasons)))
@@ -292,7 +351,7 @@ def _generate_and_audit_with_gemini(
                 response_mime_type="application/json",
             ),
         )
-        return candidate_response_text, (audit_response.text or "").strip()
+        return json.dumps(candidate_rules), (audit_response.text or "").strip()
     finally:
         # The PDFs are needed only for this single rule-generation request.
         for uploaded_file in uploaded_files:
@@ -321,6 +380,9 @@ Pass a rule only when all conditions are true:
   Treat it as an inferred general
   rule, never as a document citation. Reject speculative constraints, routine
   ID completeness checks, or rules that could reject legitimate records.
+  Do not assume primary/foreign keys from column names. Reject invented
+  categorical value lists, date formats, policy codes, data conversions, and
+  broad checks combining unrelated columns.
 - Its SQL checks exactly the quoted control or general rationale.
 - The SQL uses only the supplied DataFrame columns.
 - The SQL has exactly this form: SELECT * FROM {placeholder} WHERE

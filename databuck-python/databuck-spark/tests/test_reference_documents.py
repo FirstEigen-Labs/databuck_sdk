@@ -96,7 +96,7 @@ class ReferenceDocumentTests(unittest.TestCase):
             self.assertIn("Source document: banking_policy.pdf", output.getvalue())
             self.assertEqual(generate.call_args.kwargs["allowed_sources"],
                              {path.name, "BuckGPT_Intel"})
-            self.assertIn("Generate up to 25", generate.call_args.kwargs["prompt"])
+            self.assertIn("Generate up to 30", generate.call_args.kwargs["prompt"])
 
     def test_general_rule_uses_intel_source_and_rationale(self):
         df = SimpleNamespace(schema=SimpleNamespace(fields=[]))
@@ -159,6 +159,7 @@ class ReferenceDocumentTests(unittest.TestCase):
         with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
             response_text, audit_text = _generate_and_audit_with_gemini(
                 "test-key", "test-model", "prompt", [], {"policy.pdf"},
+                rule_count=1,
             )
         self.assertEqual(json.loads(response_text), [rule])
         self.assertEqual(json.loads(audit_text), audit)
@@ -166,6 +167,79 @@ class ReferenceDocumentTests(unittest.TestCase):
         retry_prompt = client.models.generate_content.call_args_list[1].kwargs["contents"][0]
         self.assertIn("source_document is not an allowed filename", retry_prompt)
         self.assertIn('["policy.pdf"]', retry_prompt)
+
+    def test_document_rules_are_generated_before_general_rules(self):
+        document_rule = {
+            "name": "Required account", "description": "Account is required.",
+            "source_document": "policy.pdf", "reference_context": "Account is required.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE account_id IS NULL",
+        }
+        general_rule = {
+            "name": "Funding consistency", "description": "Investor funding is limited.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Investor funding is part of total funding.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt_inv > funded_amnt",
+        }
+        audit = [
+            {"rule_index": index, "audit_status": "PASSED", "audit_reason": "Valid."}
+            for index in (1, 2)
+        ]
+        client = Mock()
+        uploaded_file = SimpleNamespace(name="uploaded-policy")
+        client.files.upload.return_value = uploaded_file
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text=json.dumps([document_rule])),
+            SimpleNamespace(text=json.dumps([general_rule])),
+            SimpleNamespace(text=json.dumps(audit)),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            response_text, _ = _generate_and_audit_with_gemini(
+                "test-key", "test-model", "prompt", ["/some/policy.pdf"],
+                {"policy.pdf", "BuckGPT_Intel"}, rule_count=2,
+            )
+        self.assertEqual(json.loads(response_text), [document_rule, general_rule])
+        calls = client.models.generate_content.call_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertIn("Document-backed phase", calls[0].kwargs["contents"][0])
+        self.assertIn("General-rule phase", calls[1].kwargs["contents"][0])
+        self.assertIn('"source_document": "policy.pdf"', calls[2].kwargs["contents"][0])
+        self.assertEqual(calls[0].kwargs["contents"][1:], [uploaded_file])
+        self.assertEqual(len(calls[1].kwargs["contents"]), 1)
+        self.assertEqual(calls[2].kwargs["contents"][1:], [uploaded_file])
+        client.files.delete.assert_called_once_with(name="uploaded-policy")
+
+    def test_empty_document_phase_can_still_generate_general_rules(self):
+        general_rule = {
+            "name": "Funding consistency", "description": "Investor funding is limited.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Investor funding is part of total funding.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt_inv > funded_amnt",
+        }
+        client = Mock()
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text="[]"),
+            SimpleNamespace(text=json.dumps([general_rule])),
+            SimpleNamespace(text=json.dumps([{
+                "rule_index": 1, "audit_status": "PASSED", "audit_reason": "Valid.",
+            }])),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                response_text, _ = _generate_and_audit_with_gemini(
+                    "test-key", "test-model", "prompt", [],
+                    {"policy.docx", "BuckGPT_Intel"}, rule_count=2,
+                )
+        self.assertEqual(json.loads(response_text), [general_rule])
 
 
 if __name__ == "__main__":
