@@ -33,8 +33,8 @@ class CriticalSelectionTests(unittest.TestCase):
         google.genai = genai
         self.modules = {"google": google, "google.genai": genai}
 
-    def test_domain_enables_general_buckgpt_rules_and_selection_uses_business_impact(self):
-        self.assertTrue(has_rule_reference_context({"domain_name": "banking"}))
+    def test_domain_selects_critical_rules_without_enabling_buckgpt_generation(self):
+        self.assertFalse(has_rule_reference_context({"domain_name": "banking"}))
         self.client.models.generate_content.return_value.text = '["not_null_account_id"]'
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
