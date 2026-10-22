@@ -33,8 +33,8 @@ class CriticalSelectionTests(unittest.TestCase):
         google.genai = genai
         self.modules = {"google": google, "google.genai": genai}
 
-    def test_domain_is_not_a_buckgpt_policy_and_selection_uses_business_impact(self):
-        self.assertFalse(has_rule_reference_context({"domain_name": "banking"}))
+    def test_domain_enables_general_buckgpt_rules_and_selection_uses_business_impact(self):
+        self.assertTrue(has_rule_reference_context({"domain_name": "banking"}))
         self.client.models.generate_content.return_value.text = '["not_null_account_id"]'
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
@@ -50,6 +50,8 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertIn("Account records must be linkable", prompt)
         self.assertIn('"rule_type": "Null Check"', prompt)
         self.assertIn('"nullThreshold": 0', prompt)
+        self.assertIn("smallest defensible set", prompt)
+        self.assertIn("strongest, clearest check", prompt)
         self.assertNotIn("test-key", prompt)
         self.assertNotIn("DataFrame sample", prompt)
         self.df.limit.assert_not_called()
@@ -150,7 +152,7 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertEqual(selected, set(expectations))
         self.client.models.generate_content.assert_called_once()
         prompt = self.client.models.generate_content.call_args.kwargs["contents"]
-        self.assertIn("is no target count", prompt)
+        self.assertIn("Do not aim for a fixed count or percentage", prompt)
         self.assertNotIn("BuckGPT_Rule_", prompt)
 
     def test_profile_metadata_excludes_sample_values(self):

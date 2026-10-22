@@ -48,9 +48,9 @@ class ReferenceDocumentTests(unittest.TestCase):
             )
             self.assertIn("Account ID is required.", prompt)
             self.assertIn("policy.docx", prompt)
-            self.assertIn('Allowed source_document values (copy one exactly for each rule):\n["policy.docx"]', prompt)
+            self.assertIn('Allowed source_document values (copy one exactly for each rule):\n["BuckGPT_Intel", "policy.docx"]', prompt)
             self.assertIn("Subscriber ID is required.", _build_audit_prompt(prompt, []))
-            self.assertIn("named\n  source_document", _build_audit_prompt(prompt, []))
+            self.assertIn("named source_document", _build_audit_prompt(prompt, []))
 
     def test_invalid_docx_has_clear_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,7 +94,35 @@ class ReferenceDocumentTests(unittest.TestCase):
                     })
             self.assertEqual(rules[0]["source_document"], path.name)
             self.assertIn("Source document: banking_policy.pdf", output.getvalue())
-            self.assertEqual(generate.call_args.kwargs["allowed_sources"], {path.name})
+            self.assertEqual(generate.call_args.kwargs["allowed_sources"],
+                             {path.name, "BuckGPT_Intel"})
+            self.assertIn("Generate up to 25", generate.call_args.kwargs["prompt"])
+
+    def test_general_rule_uses_intel_source_and_rationale(self):
+        df = SimpleNamespace(schema=SimpleNamespace(fields=[]))
+        prompt = _build_prompt(df, {"domain_name": "banking"}, 10, [], [])
+        self.assertIn('source_document to "BuckGPT_Intel"', prompt)
+        self.assertIn('relationships involving 3 to 5 columns', prompt)
+        self.assertIn('"BuckGPT_Intel" rule has a reference_context beginning',
+                      _build_audit_prompt(prompt, []))
+        rule = {
+            "name": "Funding consistency",
+            "description": "Investor funding cannot exceed total funding.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Investor-funded amount is a component of the total funded amount.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt_inv > funded_amnt",
+        }
+        audit = [{"rule_index": 1, "audit_status": "PASSED",
+                  "audit_reason": "The two funding columns support this relationship."}]
+        with patch("databuck.agentic_rules._generate_and_audit_with_gemini",
+                   return_value=(json.dumps([rule]), json.dumps(audit))):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rules = discover_rules(df, {"gemini_api_key": "test-key",
+                                             "domain_name": "banking"})
+        self.assertEqual(rules[0]["source_document"], "BuckGPT_Intel")
+        self.assertEqual(rules[0]["reference_context"], rule["reference_context"])
+        unlabeled = dict(rule, reference_context="Investor funding is part of total funding.")
+        self.assertEqual(_parse_rules(json.dumps([unlabeled]), {"BuckGPT_Intel"}), [])
 
     def test_rule_with_unknown_document_source_is_rejected(self):
         rule = {

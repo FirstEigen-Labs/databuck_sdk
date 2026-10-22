@@ -358,9 +358,18 @@ identify a concrete business consequence if that exact check fails, supported
 by the supplied business context, schema, and candidate metadata. A profiling
 pattern or length learned from observed data is not automatically a business
 requirement. A BuckGPT rule passing its policy audit is not automatically
-business critical; use its quoted reference and source to judge impact. Do not
-retain every rule merely because the domain is regulated. Select as many or as
-few rules as the evidence supports; there is no target count.
+business critical; use its reference or stated rationale and source to judge
+impact. Do not retain every rule merely because the domain is regulated.
+
+Prioritize the most consequential rules for this dataset's business purpose.
+Return the smallest defensible set that a business reviewer can examine and
+act on. Compare candidates against one another: when several rules protect the
+same outcome, keep the strongest, clearest check and omit weaker or redundant
+ones. Keep distinct legal or business obligations when each has a material
+consequence. Internally identify the consequence for every selected rule;
+exclude any rule whose impact you cannot explain from the supplied context.
+Do not aim for a fixed count or percentage, and do not select all candidates
+by default.
 Return only a JSON array of candidate integer IDs to retain. Use the IDs shown
 below; do not create names, SQL, or explanations. Return [] if none qualify.
 

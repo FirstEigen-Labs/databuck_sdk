@@ -10,6 +10,7 @@ from xml.etree import ElementTree
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 DATAFRAME_PLACEHOLDER = "{{DATAFRAME}}"
+INTEL_SOURCE = "BuckGPT_Intel"
 _CONTROL_CONTEXT_KEYS = {
     "gemini_api_key", "gemini_model", "rule_count", "pdf_paths",
     "include_failed_rules", "domain_name",
@@ -17,14 +18,15 @@ _CONTROL_CONTEXT_KEYS = {
 
 
 def has_rule_reference_context(context: dict) -> bool:
-    """Whether context supplies statements from which BuckGPT can build rules."""
-    return bool(context.get("pdf_paths")) or any(
+    """Whether context supplies a domain or statements for BuckGPT rules."""
+    return bool(context.get("pdf_paths") or context.get("domain_name")) or any(
         value for key, value in context.items() if key not in _CONTROL_CONTEXT_KEYS
     )
 
 
 def _allowed_rule_sources(context: dict, reference_paths: list[str]) -> set[str]:
-    sources = {os.path.basename(path) for path in reference_paths}
+    sources = {INTEL_SOURCE}
+    sources.update(os.path.basename(path) for path in reference_paths)
     if any(value for key, value in context.items() if key not in _CONTROL_CONTEXT_KEYS):
         sources.add("business_context")
     return sources
@@ -48,7 +50,7 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
             "or the GEMINI_API_KEY environment variable."
         )
 
-    rule_count = int(context.get("rule_count", 10))
+    rule_count = int(context.get("rule_count", 25))
     if rule_count < 1 or rule_count > 50:
         raise ValueError("context['rule_count'] must be between 1 and 50")
 
@@ -120,42 +122,60 @@ def _build_prompt(
 
     return """You are a data-quality rule generator.
 Generate up to {rule_count} accurate data-quality SQL rules for the DataFrame
-described below. It is acceptable to return fewer rules when the supplied
-reference context does not define enough unambiguous controls.
+described below. It is acceptable to return fewer rules when few checks are
+well supported by the supplied context, schema, and domain.
 The attached PDFs and Word document text are approved reference context. Use
-them when they support a rule. If a rule is based on a document, identify the
-relevant policy text in reference_context.
+them when they support a rule. Also create a few general data-quality rules
+when the schema and business domain make their checks genuinely useful and
+their invalid-row conditions are unambiguous. Do not create generic rules
+merely to fill the rule count or duplicate a more specific context-aware rule.
+Prioritize supported context-aware controls, then use remaining capacity for
+the most useful general rules.
+If a rule is based on a document, identify the relevant policy text in
+reference_context.
 Use the business domain to interpret the terminology and prioritize relevant
 controls. The domain name alone is not a policy statement and cannot justify
-a rule without an explicit supporting statement.
+a context-aware rule without an explicit supporting statement. General rules
+may use domain knowledge and schema semantics, subject to the safeguards below.
 
-Return a nonempty JSON array when at least one fully supported rule can be
-derived. Do not return [] merely because some documents are irrelevant. Return
-[] only when no supplied statement supports a valid rule. Every item must
-contain exactly these string fields:
+Return a nonempty JSON array when at least one defensible rule can be derived.
+Do not return [] merely because some documents are irrelevant. Return [] only
+when neither supported context-aware nor defensible general rules exist.
+Every item must contain exactly these string fields:
 name, description, source_document, reference_context, sql.
 
 Reference requirements:
-- Every rule must be supported by exactly one explicit policy or business
+- For a context-aware rule, use exactly one explicit policy or business
   statement from the supplied context or reference documents.
-- reference_context must quote that exact supporting statement. Do not
-  paraphrase, combine statements, or claim a reference that does not exist.
-- source_document must be the exact filename from Reference document names
-  containing the quoted statement. If the statement instead comes from the
-  Business context block, use "business_context" only when that value appears
-  in Allowed source_document values. Never use a full path, URL, section title,
-  an empty value, or an invented filename.
-- Do not infer additional business meaning, ID patterns, allowed values,
-  thresholds, column relationships, or statuses that are not explicitly stated.
+- For a context-aware rule, reference_context must quote that exact supporting
+  statement. Do not paraphrase, combine statements, or claim a nonexistent
+  reference. source_document must be the exact filename containing the quote,
+  or "business_context" for a quote from the Business context block.
+- For a general rule, set source_document to "BuckGPT_Intel" and begin
+  reference_context with "BuckGPT_Intel: " followed by a brief rationale
+  explaining the schema/domain semantics and why the check matters. This is
+  an inferred rule, not a policy citation. Do not invent or attribute a quote
+  to a document. Prefer simple, broadly valid
+  invariants over speculative checks; omit a rule when the column meaning is
+  ambiguous or the check could reject legitimate records.
+- Never use a full path, URL, section title, an empty value, or an invented
+  source_document value.
+- Do not infer ID patterns, allowed values, thresholds, statuses, or business
+  relationships from a column name alone. Do not assert that an ID must be
+  non-null merely because its name ends in ID.
 - Do not downgrade a "valid" requirement into a null/empty check. A validity
   rule requires an explicit format, allowed-value list, or validation condition.
-- A null/empty check is permitted only when the reference explicitly says
-  required, present, non-null, non-empty, or mandatory.
-- When one explicit statement defines an intercolumn relationship involving
-  3 to 5 columns in the schema, create one rule that checks the full
-  relationship across all stated columns. Include every involved column in
-  the invalid-row SQL condition; do not split the relationship into weaker
-  pairwise checks. Do not create such a rule without an explicit statement.
+- A context-aware null/empty check is permitted only when the reference
+  explicitly says required, present, non-null, non-empty, or mandatory.
+- A general null/empty check needs a clear business necessity beyond the
+  column name; avoid routine completeness checks on technical identifiers.
+- Look for meaningful intercolumn relationships involving 3 to 5 columns in
+  the schema. If one explicit statement defines such a relationship, create
+  one rule checking the full relationship across all stated columns. For a
+  general rule, use a relationship only when its meaning follows clearly from
+  schema semantics and domain knowledge without invented values or thresholds.
+  Include every involved column in the invalid-row SQL condition; do not
+  split a supported full relationship into weaker pairwise checks.
 - If a reference is ambiguous or does not define an executable check, omit it.
 
 SQL requirements:
@@ -173,7 +193,8 @@ SQL requirements:
 - Do not generate INSERT, UPDATE, DELETE, MERGE, DROP, CREATE, ALTER, or CALL.
 
 Before returning each rule, internally verify that the SQL checks exactly what
-the quoted reference_context states. Omit the rule if they do not match.
+its quote or stated general rationale supports. Omit the rule if they do not
+match.
 
 DataFrame schema:
 {schema}
@@ -232,7 +253,10 @@ def _generate_and_audit_with_gemini(
                 generation_prompt += (
                     "\nThe previous response contained no valid rules: {}. "
                     "Try again. Use only these exact source_document values: {}. "
-                    "Every rule needs a quoted reference_context and SQL beginning "
+                    "Context-aware rules need a quoted reference_context; "
+                    "BuckGPT_Intel rules need reference_context starting "
+                    "'BuckGPT_Intel: ' followed by a clear general rationale. "
+                    "Every rule needs SQL beginning "
                     "SELECT * FROM {} WHERE. Return [] only if no supported rule exists."
                 ).format(", ".join(sorted(set(rejection_reasons))) or "empty response",
                          json.dumps(sorted(allowed_sources)), DATAFRAME_PLACEHOLDER)
@@ -288,19 +312,28 @@ rule_index (integer, starting at 1), audit_status (PASSED or FAILED), and
 audit_reason (string).
 
 Pass a rule only when all conditions are true:
-- Its reference_context exactly quotes one explicit statement in its named
-  source_document. The filename must identify the document containing the
-  quote; "business_context" must identify a statement in Business context.
-- Its SQL checks exactly the control stated in that reference.
+- A context-aware rule's reference_context exactly quotes one explicit
+  statement in its named source_document. The filename must identify the
+  document containing the quote; "business_context" must identify a statement
+  in Business context.
+- A "BuckGPT_Intel" rule has a reference_context beginning "BuckGPT_Intel: "
+  and a clear rationale based on the supplied schema and business domain.
+  Treat it as an inferred general
+  rule, never as a document citation. Reject speculative constraints, routine
+  ID completeness checks, or rules that could reject legitimate records.
+- Its SQL checks exactly the quoted control or general rationale.
 - The SQL uses only the supplied DataFrame columns.
 - The SQL has exactly this form: SELECT * FROM {placeholder} WHERE
   <invalid-row condition>. It contains no joins, grouping, ordering,
   subqueries, or additional statements.
-- The SQL does not invent formats, values, thresholds, relationships, or logic.
+- The SQL does not invent formats, values, thresholds, or unsupported logic.
+  General column relationships must follow clearly from schema semantics and
+  domain knowledge; context-aware relationships need an explicit reference.
 - A "valid" reference has an explicit format, allowed-value list, or validation
   condition; null/empty SQL alone must fail such a rule.
-- A null/empty SQL check is supported only by a reference that explicitly says
-  required, present, non-null, non-empty, or mandatory.
+- A context-aware null/empty SQL check needs a reference that explicitly says
+  required, present, non-null, non-empty, or mandatory. A general null/empty
+  check needs a specific business necessity beyond the column name.
 
 Fail ambiguous, partly supported, over-broad, or mismatched rules. Explain the
 specific mismatch in audit_reason.
@@ -432,6 +465,12 @@ def _parse_rules(response_text: str, allowed_sources: set[str],
         if source_document not in allowed_sources:
             if rejection_reasons is not None:
                 rejection_reasons.append("source_document is not an allowed filename")
+            continue
+        if source_document == INTEL_SOURCE and not reference_context.startswith(
+            INTEL_SOURCE + ": "
+        ):
+            if rejection_reasons is not None:
+                rejection_reasons.append("BuckGPT_Intel rule needs a labeled rationale")
             continue
         if not re.match(r"^SELECT\b", sql, re.IGNORECASE):
             if rejection_reasons is not None:
