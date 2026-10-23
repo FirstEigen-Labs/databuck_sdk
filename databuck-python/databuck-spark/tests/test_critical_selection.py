@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 import os
 import sys
 import unittest
@@ -35,7 +38,7 @@ class CriticalSelectionTests(unittest.TestCase):
 
     def test_domain_enables_buckgpt_generation_and_critical_selection(self):
         self.assertTrue(has_rule_reference_context({"domain_name": "banking"}))
-        self.client.models.generate_content.return_value.text = '["not_null_account_id"]'
+        self.client.models.generate_content.return_value.text = '[{"id":2,"priority":"HIGH"}]'
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
                 self.expectations, self.df, {
@@ -52,14 +55,15 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertIn('"nullThreshold": 0', prompt)
         self.assertIn("smallest defensible set", prompt)
         self.assertIn("strongest, clearest check", prompt)
+        self.assertIn("HIGH, MEDIUM, or LOW", prompt)
         self.assertNotIn("test-key", prompt)
         self.assertNotIn("DataFrame sample", prompt)
         self.df.limit.assert_not_called()
 
     def test_selection_rejects_unknown_names(self):
-        self.client.models.generate_content.return_value.text = '["invented_rule"]'
+        self.client.models.generate_content.return_value.text = '[{"id":3,"priority":"HIGH"}]'
         with patch.dict(sys.modules, self.modules):
-            with self.assertRaisesRegex(ValueError, "unknown expectation names: invented_rule"):
+            with self.assertRaisesRegex(ValueError, "candidate ID is outside the available range"):
                 _select_critical_expectations(
                     self.expectations, self.df,
                     {"domain_name": "banking", "gemini_api_key": "test-key"},
@@ -67,22 +71,23 @@ class CriticalSelectionTests(unittest.TestCase):
                 )
         self.assertEqual(self.client.models.generate_content.call_count, 2)
 
-    def test_selection_accepts_named_objects_without_changing_rules(self):
+    def test_selection_prints_priorities_without_changing_rules(self):
         self.client.models.generate_content.return_value.text = (
-            '{"selected_rules":[{"name":"not_null_account_id",'
-            '"reason":"Required for reconciliation"}]}'
+            '[{"id":2,"priority":"MEDIUM"}]'
         )
-        with patch.dict(sys.modules, self.modules):
+        output = io.StringIO()
+        with patch.dict(sys.modules, self.modules), contextlib.redirect_stdout(output):
             selected = _select_critical_expectations(
                 self.expectations, self.df,
                 {"domain_name": "banking", "gemini_api_key": "test-key"},
                 self.metadata,
             )
         self.assertEqual(selected, {"not_null_account_id"})
+        self.assertIn("DataBuck: critical rule [MEDIUM] not_null_account_id", output.getvalue())
         self.client.models.generate_content.assert_called_once()
 
     def test_selection_accepts_candidate_ids(self):
-        self.client.models.generate_content.return_value.text = '[2]'
+        self.client.models.generate_content.return_value.text = '[{"id":2,"priority":"LOW"}]'
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
                 self.expectations, self.df,
@@ -103,7 +108,7 @@ class CriticalSelectionTests(unittest.TestCase):
             "reference_context": "Balances must not be negative.",
             "invalid_row_sql": "SELECT * FROM {{DATAFRAME}} WHERE balance < 0",
         }}
-        self.client.models.generate_content.return_value.text = "[3]"
+        self.client.models.generate_content.return_value.text = '[{"id":3,"priority":"HIGH"}]'
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
                 expectations, self.df,
@@ -119,7 +124,7 @@ class CriticalSelectionTests(unittest.TestCase):
     def test_selection_retries_a_malformed_response_once(self):
         self.client.models.generate_content.side_effect = [
             SimpleNamespace(text='{"unexpected":"shape"}'),
-            SimpleNamespace(text='["not_null_account_id"]'),
+            SimpleNamespace(text='[{"id":2,"priority":"HIGH"}]'),
         ]
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
@@ -129,6 +134,37 @@ class CriticalSelectionTests(unittest.TestCase):
             )
         self.assertEqual(selected, {"not_null_account_id"})
         self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_selection_retries_missing_priority(self):
+        self.client.models.generate_content.side_effect = [
+            SimpleNamespace(text='[{"id":2}]'),
+            SimpleNamespace(text='[{"id":2,"priority":"HIGH"}]'),
+        ]
+        with patch.dict(sys.modules, self.modules):
+            selected = _select_critical_expectations(
+                self.expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                self.metadata,
+            )
+        self.assertEqual(selected, {"not_null_account_id"})
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_selection_prints_buckgpt_title(self):
+        expectations = {"BuckGPT_Rule_001": "NOT COALESCE((balance < 0), FALSE)"}
+        metadata = {"BuckGPT_Rule_001": {
+            "name": "Nonnegative balance", "description": "Balance must be positive",
+            "source_document": "policy.pdf", "reference_context": "Balances must be positive.",
+        }}
+        self.client.models.generate_content.return_value.text = '[{"id":1,"priority":"HIGH"}]'
+        output = io.StringIO()
+        with patch.dict(sys.modules, self.modules), contextlib.redirect_stdout(output):
+            selected = _select_critical_expectations(
+                expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                [], metadata,
+            )
+        self.assertEqual(selected, {"BuckGPT_Rule_001"})
+        self.assertIn("[HIGH] BuckGPT_Rule_001: Nonnegative balance", output.getvalue())
 
     def test_selection_can_return_no_critical_profile_rules(self):
         self.client.models.generate_content.return_value.text = '[]'
@@ -143,7 +179,9 @@ class CriticalSelectionTests(unittest.TestCase):
     def test_selection_has_no_fixed_count_limit(self):
         expectations = {"not_null_field_{}".format(index): "`field_{}` IS NOT NULL".format(index)
                         for index in range(107)}
-        self.client.models.generate_content.return_value.text = str(list(range(1, 108)))
+        self.client.models.generate_content.return_value.text = json.dumps([
+            {"id": index, "priority": "LOW"} for index in range(1, 108)
+        ])
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
                 expectations, self.df,

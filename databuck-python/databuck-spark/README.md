@@ -162,7 +162,9 @@ quote or `BuckGPT_Intel` and its general business rationale.
 The exported JSON and YAML files contain the rule conditions. When
 `domain_name` is supplied, business-critical selection applies to both
 auto-discovered and BuckGPT rules. The notebook prints the retained count for
-each source. This selection has no fixed rule count.
+each source and each selected rule's HIGH, MEDIUM, or LOW business priority.
+Priorities appear only in the notebook log, not in exported JSON or YAML.
+This selection has no fixed rule count.
 The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
 notebook driver. PDF files are uploaded to Gemini; text from Word documents is
 extracted locally and included in the generation and audit prompts. Images or

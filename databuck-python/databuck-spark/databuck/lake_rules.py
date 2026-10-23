@@ -221,6 +221,7 @@ class DiscoveredRules(list):
             else:
                 expectations[name] = _context_rule_expectation(rule, name)
             buckgpt_metadata[name] = {
+                "name": rule.get("name"),
                 "description": rule.get("description"),
                 "source_document": rule.get("source_document"),
                 "reference_context": rule.get("reference_context"),
@@ -409,8 +410,16 @@ consequence. Internally identify the consequence for every selected rule;
 exclude any rule whose impact you cannot explain from the supplied context.
 Do not aim for a fixed count or percentage, and do not select all candidates
 by default.
-Return only a JSON array of candidate integer IDs to retain. Use the IDs shown
-below; do not create names, SQL, or explanations. Return [] if none qualify.
+For each selected rule, assign a relative business priority using your
+{domain_name} expertise: HIGH for immediate regulatory, financial, customer,
+or operational impact; MEDIUM for a material but less urgent impact; LOW for
+a still worthwhile business review with lower impact. LOW does not mean a
+routine or unsupported rule should be selected. Use the same business context
+and rule evidence for both selection and priority.
+Return only a JSON array of objects with integer id and string priority
+(HIGH, MEDIUM, or LOW), for example [{{"id": 2, "priority": "HIGH"}}].
+Use only the candidate IDs shown below. Do not create names, SQL, or
+explanations. Return [] if none qualify.
 
 Business context:
 {context}
@@ -437,13 +446,19 @@ Auto-discovered and audited BuckGPT candidates (no sample records):
             model=context.get("gemini_model", "gemini-2.5-flash"),
             contents=prompt if attempt == 0 else (
                 prompt + ("\nYour previous response was invalid: {}. "
-                          "Return only valid integer IDs from the candidate list "
-                          "as a JSON array.").format(retry_reason)
+                          "Return a JSON array of objects with valid integer id "
+                          "and priority HIGH, MEDIUM, or LOW.").format(retry_reason)
             ),
             config=config,
         )
         try:
-            return _parse_critical_profile_selection(response.text or "", expectations)
+            priorities = _parse_critical_profile_selection(response.text or "", expectations)
+            for name, priority in priorities.items():
+                rule_title = buckgpt_metadata.get(name, {}).get("name")
+                display_name = "{}: {}".format(name, rule_title) if rule_title else name
+                print("DataBuck: critical rule [{}] {}".format(priority, display_name),
+                      flush=True)
+            return set(priorities)
         except ValueError as exc:
             retry_reason = str(exc)
             if attempt == 1:
@@ -458,34 +473,25 @@ def _parse_critical_profile_selection(response_text, expectations):
         result = json.loads(response_text.strip())
     except json.JSONDecodeError as exc:
         raise ValueError("response is not valid JSON") from exc
-    if isinstance(result, dict):
-        for key in ("selected_ids", "selected_rule_ids", "candidate_ids",
-                    "selected_rule_names", "selected_rules", "critical_rules",
-                    "selected_expectations", "rules"):
-            if key in result:
-                result = result[key]
-                break
     if not isinstance(result, list):
-        raise ValueError("response must contain a list of expectation names")
+        raise ValueError("response must be a list of selected rule objects")
 
     candidate_names = list(expectations)
-    names = []
+    priorities = {}
     for item in result:
-        if isinstance(item, dict):
-            item = next((item[key] for key in ("id", "candidate_id", "name",
-                        "expectation_name", "rule_name", "expectation") if key in item), None)
-        if isinstance(item, int) and not isinstance(item, bool):
-            if item < 1 or item > len(candidate_names):
-                raise ValueError("candidate ID is outside the available range")
-            names.append(candidate_names[item - 1])
-        elif isinstance(item, str) and item.strip():
-            names.append(item.strip())
-        else:
-            raise ValueError("each selected rule must have a candidate ID or name")
-    unknown = sorted(set(names) - set(expectations))
-    if unknown:
-        raise ValueError("unknown expectation names: {}".format(", ".join(unknown[:3])))
-    return set(names)
+        if not isinstance(item, dict):
+            raise ValueError("each selected rule needs an id and priority")
+        rule_id = item.get("id")
+        priority = item.get("priority")
+        if not isinstance(rule_id, int) or isinstance(rule_id, bool) or not 1 <= rule_id <= len(candidate_names):
+            raise ValueError("candidate ID is outside the available range")
+        if not isinstance(priority, str) or priority.upper() not in {"HIGH", "MEDIUM", "LOW"}:
+            raise ValueError("priority must be HIGH, MEDIUM, or LOW")
+        name = candidate_names[rule_id - 1]
+        if name in priorities:
+            raise ValueError("duplicate candidate ID: {}".format(rule_id))
+        priorities[name] = priority.upper()
+    return priorities
 
 
 def _classify_actions_with_llm(expectations, df, context):
