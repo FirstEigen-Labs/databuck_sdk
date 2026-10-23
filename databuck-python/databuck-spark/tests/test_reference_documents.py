@@ -74,7 +74,7 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertIn("Balances must reconcile", prompt)
         self.assertIn("Business domain:\nbanking", _build_audit_prompt(prompt, []))
 
-    def test_fifty_sample_rows_reach_policy_and_general_prompts(self):
+    def test_ten_sample_rows_reach_policy_and_general_prompts(self):
         df = Mock()
         df.schema.fields = [SimpleNamespace(
             name="balance", dataType=SimpleNamespace(simpleString=lambda: "double"),
@@ -85,15 +85,17 @@ class ReferenceDocumentTests(unittest.TestCase):
             for number in range(51)
         ]
         rows = _sample_rows(df)
-        df.limit.assert_called_once_with(50)
-        self.assertEqual(len(rows), 50)
-        self.assertEqual(rows[-1], {"balance": 49})
+        df.limit.assert_called_once_with(10)
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(rows[-1], {"balance": 9})
         context = {"domain_name": "banking"}
         policy = _build_prompt(df, context, [], [], sample_rows=rows)
         general = _build_general_prompt(df, context, rows)
-        self.assertIn('"balance": 49', policy)
-        self.assertIn('"balance": 49', general)
-        self.assertNotIn('"balance": 50', policy + general)
+        self.assertIn('"columns": ["balance"]', policy)
+        self.assertIn('"rows": [[0], [1]', policy)
+        self.assertIn('[9]]}', policy)
+        self.assertIn('[9]]}', general)
+        self.assertNotIn('[10]', policy + general)
         self.assertIn("BuckGPT_Intel", general)
         self.assertNotIn("BuckGPT_Intel", policy)
 
@@ -113,9 +115,9 @@ class ReferenceDocumentTests(unittest.TestCase):
                 "gemini_api_key": "test-key", "domain_name": "banking",
             }), [])
         kwargs = generate.call_args.kwargs
-        self.assertIn('"balance": 12.5', kwargs["prompt"])
-        self.assertIn('"balance": 12.5', kwargs["general_prompt"])
-        df.limit.assert_called_once_with(50)
+        self.assertIn('"rows": [[12.5]]', kwargs["prompt"])
+        self.assertIn('"rows": [[12.5]]', kwargs["general_prompt"])
+        df.limit.assert_called_once_with(10)
 
     def test_policy_and_general_candidates_share_audit(self):
         policy_rule = {
@@ -183,6 +185,8 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertEqual(_parse_rules(json.dumps([policy]),
                                       {"policy.pdf", "BuckGPT_Intel"},
                                       schema_columns=["loan_id"]), [])
+        self.assertIn("Do not reject the rule\n  merely because sql is now nonempty",
+                      _build_audit_prompt("policy and general prompts", parsed))
 
     def test_discovered_rule_prints_its_document_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -345,6 +349,7 @@ class ReferenceDocumentTests(unittest.TestCase):
         client.models.generate_content.side_effect = [
             SimpleNamespace(text="[]"),
             SimpleNamespace(text="[]"),
+            SimpleNamespace(text="[]"),
         ]
         google = ModuleType("google")
         genai = ModuleType("google.genai")
@@ -358,10 +363,47 @@ class ReferenceDocumentTests(unittest.TestCase):
                     {"policy.docx"},
                 )
         self.assertEqual(json.loads(response_text), [])
-        self.assertEqual(client.models.generate_content.call_count, 2)
+        self.assertEqual(client.models.generate_content.call_count, 3)
         self.assertIn("review each reference again",
                       client.models.generate_content.call_args_list[1]
                       .kwargs["contents"][0])
+        self.assertIn("Focused document review",
+                      client.models.generate_content.call_args_list[2]
+                      .kwargs["contents"][0])
+
+    def test_focused_document_recovery_can_restore_policy_rules(self):
+        document_rule = {
+            "name": "Required account", "description": "Account is required.",
+            "source_document": "policy.pdf",
+            "reference_context": "Account is required.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE account_id IS NULL",
+        }
+        audit = [{"rule_index": 1, "audit_status": "PASSED",
+                  "audit_reason": "Quoted policy requires account."}]
+        client = Mock()
+        uploaded = SimpleNamespace(name="uploaded-policy")
+        client.files.upload.return_value = uploaded
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text="[]"),
+            SimpleNamespace(text="[]"),
+            SimpleNamespace(text=json.dumps([document_rule])),
+            SimpleNamespace(text=json.dumps(audit)),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            response_text, audit_text = _generate_and_audit_with_gemini(
+                "test-key", "test-model", "policy prompt with 10 sample rows",
+                ["/some/policy.pdf"], {"policy.pdf"},
+            )
+        self.assertEqual(json.loads(response_text), [document_rule])
+        self.assertEqual(json.loads(audit_text), audit)
+        self.assertEqual(client.models.generate_content.call_count, 4)
+        self.assertEqual(client.models.generate_content.call_args_list[2]
+                         .kwargs["contents"][1:], [uploaded])
 
     def test_failed_document_audit_retries_with_reason_and_reaudits(self):
         rejected_rule = {

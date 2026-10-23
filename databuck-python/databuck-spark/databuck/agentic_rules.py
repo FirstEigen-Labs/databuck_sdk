@@ -109,8 +109,17 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
 
 
 def _sample_rows(df: Any) -> list[dict[str, Any]]:
-    """Send at most 50 existing DataFrame rows to BuckGPT generation."""
-    return [row.asDict(recursive=True) for row in df.limit(50).collect()[:50]]
+    """Send at most 10 existing DataFrame rows to BuckGPT generation."""
+    return [row.asDict(recursive=True) for row in df.limit(10).collect()[:10]]
+
+
+def _compact_sample_rows(df: Any, sample_rows: list[dict[str, Any]]) -> str:
+    """List column names once while preserving every sampled value."""
+    columns = [field.name for field in df.schema.fields]
+    return json.dumps({
+        "columns": columns,
+        "rows": [[row.get(column) for column in columns] for row in sample_rows],
+    }, default=str, ensure_ascii=False)
 
 
 def _build_prompt(
@@ -150,7 +159,9 @@ all of them when they support a rule. Generate only rules supported by an
 explicit statement in a supplied document or Business context. Do not infer
 rules from the schema or domain alone.
 Use the sample rows to understand how schema columns represent policy concepts.
-Sample values are examples, not policy requirements or proof of uniqueness.
+Read the attached reference documents first and derive rules from their exact
+statements. Sample values are examples, not policy requirements or proof of
+uniqueness. A policy rule may matter even when no sampled row violates it.
 If a rule is based on a document, identify the relevant policy text in
 reference_context.
 Use the business domain to interpret the terminology and prioritize relevant
@@ -224,7 +235,7 @@ Allowed source_document values (copy one exactly for each rule):
 Word document text:
 {word_documents}
 
-Up to 50 sample records:
+Up to 10 sample records (columns listed once, rows in the same order):
 {sample_rows}
 """.format(
         placeholder=DATAFRAME_PLACEHOLDER,
@@ -234,7 +245,7 @@ Up to 50 sample records:
         documents=json.dumps(document_names),
         sources=json.dumps(allowed_sources),
         word_documents=json.dumps(word_documents, ensure_ascii=False),
-        sample_rows=json.dumps(sample_rows or [], default=str, ensure_ascii=False),
+        sample_rows=_compact_sample_rows(df, sample_rows or []),
     )
 
 
@@ -245,7 +256,7 @@ def _build_general_prompt(df: Any, context: dict,
     return """You are a business data-quality expert. Generate only important,
 defensible general SQL rules for the supplied DataFrame. Choose the number of
 rules based on meaningful checks; there is no target count. Use the business
-domain, schema, and up to 50 sample records to understand the data, but do not
+domain, schema, and up to 10 sample records to understand the data, but do not
 mistake a sample pattern for a universal contract. Return [] when a rule could
 reject legitimate records.
 
@@ -255,7 +266,7 @@ multi-column relationships. Also consider uniqueness of a clear business key
 or meaningful combination of key columns. Do not create routine ID null
 checks, duplicate policy rules, or invented thresholds, formats, categories,
 or relationships. Do not infer a uniqueness contract merely because values in
-50 rows differ. Do not require uniqueness of values that can legitimately recur.
+10 rows differ. Do not require uniqueness of values that can legitimately recur.
 
 Return a JSON array. Each row-level rule must have these string fields: name,
 description, source_document, reference_context, sql. Set source_document to
@@ -275,12 +286,12 @@ alone is insufficient evidence.
 
 Business domain: {domain}
 DataFrame schema: {schema}
-Sample records: {sample_rows}
+Sample records (columns listed once, rows in the same order): {sample_rows}
 """.format(
         placeholder=DATAFRAME_PLACEHOLDER,
         domain=context.get("domain_name") or "Not provided",
         schema=json.dumps(schema, default=str),
-        sample_rows=json.dumps(sample_rows, default=str, ensure_ascii=False),
+        sample_rows=_compact_sample_rows(df, sample_rows),
     )
 
 
@@ -381,6 +392,23 @@ def _generate_and_audit_with_gemini(
                 document_prompt, document_sources, uploaded_files,
                 retry_on_empty=True,
             )
+            if not generated_rules and document_sources - {"business_context"}:
+                print("BuckGPT: retrying document generation with a focused review",
+                      flush=True)
+                recovery_prompt = document_prompt + (
+                    "\nFocused document review: the earlier response produced no "
+                    "usable document rules. Inspect each attached PDF and each "
+                    "supplied Word document for explicit controls that apply to "
+                    "the schema. The 10 sample records illustrate column meaning "
+                    "but do not need to contain a violation. Return every distinct "
+                    "rule with an exact supporting quote and its correct filename. "
+                    "Do not invent requirements or return BuckGPT_Intel rules. "
+                    "Return [] only if no document contains an executable control."
+                )
+                generated_rules, recovery_rejections = generate_phase(
+                    recovery_prompt, document_sources, uploaded_files,
+                )
+                source_rejections.extend(recovery_rejections)
             rejection_reasons.extend(source_rejections)
             seen_sql = set()
             for rule in generated_rules:
@@ -523,6 +551,9 @@ Pass a rule only when all conditions are true:
   from the schema, and a dataset-level SQL query that returns duplicate key
   groups. Pass it only when its key has a convincing business identity
   rationale. Do not infer uniqueness from sample distinctness alone.
+  During generation the model leaves sql empty; before this audit the SDK
+  fills sql with its canonical duplicate-group query. Do not reject the rule
+  merely because sql is now nonempty.
 - Its SQL checks exactly the quoted control or general rationale.
 - The SQL uses only the supplied DataFrame columns.
 - A row-level rule's SQL has exactly this form: SELECT * FROM {placeholder}
