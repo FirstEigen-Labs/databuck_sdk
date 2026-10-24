@@ -58,10 +58,10 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
         for path in reference_paths if path.lower().endswith(".docx")
     ]
     schema_columns = [field.name for field in df.schema.fields]
-    sample_rows = _sample_rows(df)
+    general_sample_rows = _sample_rows(df, limit=50)
     prompt = _build_prompt(df, context, reference_paths, word_documents,
-                           sample_rows=sample_rows)
-    general_prompt = _build_general_prompt(df, context, sample_rows)
+                           sample_rows=general_sample_rows[:10])
+    general_prompt = _build_general_prompt(df, context, general_sample_rows)
     response_text, audit_response_text = _generate_and_audit_with_gemini(
         api_key=api_key,
         model=context.get("gemini_model", DEFAULT_MODEL),
@@ -108,9 +108,9 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
     return returned_rules
 
 
-def _sample_rows(df: Any) -> list[dict[str, Any]]:
-    """Send at most 10 existing DataFrame rows to BuckGPT generation."""
-    return [row.asDict(recursive=True) for row in df.limit(10).collect()[:10]]
+def _sample_rows(df: Any, limit: int = 10) -> list[dict[str, Any]]:
+    """Collect up to ``limit`` existing DataFrame rows for BuckGPT generation."""
+    return [row.asDict(recursive=True) for row in df.limit(limit).collect()[:limit]]
 
 
 def _compact_sample_rows(df: Any, sample_rows: list[dict[str, Any]]) -> str:
@@ -254,19 +254,24 @@ def _build_general_prompt(df: Any, context: dict,
     schema = [{"name": field.name, "type": field.dataType.simpleString(),
                "nullable": field.nullable} for field in df.schema.fields]
     return """You are a business data-quality expert. Generate only important,
-defensible general SQL rules for the supplied DataFrame. Choose the number of
-rules based on meaningful checks; there is no target count. Use the business
-domain, schema, and up to 10 sample records to understand the data, but do not
+defensible general SQL rules for the supplied DataFrame. Review the full
+schema systematically; for a wide schema, seek broad coverage, including 60
+or more distinct rules when that many are genuinely justified. Do not pad the
+list with redundant or speculative checks to reach a number. Use the business
+domain, schema, and up to 50 sample records to understand the data, but do not
 mistake a sample pattern for a universal contract. Return [] when a rule could
 reject legitimate records.
 
 Consider non-negative checks for amounts or counts where negative values are
-semantically impossible, and meaningful cross-column relationships, including
-multi-column relationships. Also consider uniqueness of a clear business key
+semantically impossible. Systematically inspect related amount, count, status,
+date, rate, and balance columns for meaningful cross-column relationships
+involving 2 to 4 columns. Create a rule only when the relationship follows
+clearly from the column meanings and business domain; explain its rationale.
+Also consider uniqueness of a clear business key
 or meaningful combination of key columns. Do not create routine ID null
 checks, duplicate policy rules, or invented thresholds, formats, categories,
 or relationships. Do not infer a uniqueness contract merely because values in
-10 rows differ. Do not require uniqueness of values that can legitimately recur.
+50 rows differ. Do not require uniqueness of values that can legitimately recur.
 
 Return a JSON array. Each row-level rule must have these string fields: name,
 description, source_document, reference_context, sql. Set source_document to

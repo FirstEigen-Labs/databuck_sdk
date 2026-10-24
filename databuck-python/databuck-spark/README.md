@@ -174,12 +174,8 @@ The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
 notebook driver. PDF files are uploaded to Gemini; text from Word documents is
 extracted locally and included in the generation and audit prompts. Images or
 scanned pages in a Word document are not read.
-BuckGPT sends up to 10 sample records, encoded with column names only once, to
-a document-backed generation request with all supplied PDFs and to a separate
-general-rule request. If the document request returns no rules, BuckGPT makes
-one focused document review attempt before proceeding. The first
-request creates rules supported by explicit document or Business context
-statements. The second creates useful inferred rules labeled `BuckGPT_Intel`.
+BuckGPT generates document-backed rules from the supplied references and
+general rules labeled `BuckGPT_Intel`.
 BuckGPT rules are audited and exported alongside the selected auto-discovered
 rules. General rules can include non-negative and cross-column checks. When
 BuckGPT identifies a defensible unique business key, the JSON or YAML export

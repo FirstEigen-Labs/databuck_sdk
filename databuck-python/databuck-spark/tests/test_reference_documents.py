@@ -74,7 +74,7 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertIn("Balances must reconcile", prompt)
         self.assertIn("Business domain:\nbanking", _build_audit_prompt(prompt, []))
 
-    def test_ten_sample_rows_reach_policy_and_general_prompts(self):
+    def test_policy_uses_ten_rows_and_general_uses_fifty(self):
         df = Mock()
         df.schema.fields = [SimpleNamespace(
             name="balance", dataType=SimpleNamespace(simpleString=lambda: "double"),
@@ -84,18 +84,21 @@ class ReferenceDocumentTests(unittest.TestCase):
             SimpleNamespace(asDict=lambda recursive, number=number: {"balance": number})
             for number in range(51)
         ]
-        rows = _sample_rows(df)
-        df.limit.assert_called_once_with(10)
-        self.assertEqual(len(rows), 10)
-        self.assertEqual(rows[-1], {"balance": 9})
+        rows = _sample_rows(df, limit=50)
+        df.limit.assert_called_once_with(50)
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(rows[-1], {"balance": 49})
         context = {"domain_name": "banking"}
-        policy = _build_prompt(df, context, [], [], sample_rows=rows)
+        policy = _build_prompt(df, context, [], [], sample_rows=rows[:10])
         general = _build_general_prompt(df, context, rows)
         self.assertIn('"columns": ["balance"]', policy)
         self.assertIn('"rows": [[0], [1]', policy)
         self.assertIn('[9]]}', policy)
-        self.assertIn('[9]]}', general)
-        self.assertNotIn('[10]', policy + general)
+        self.assertIn('[49]]}', general)
+        self.assertNotIn('[10]', policy)
+        self.assertNotIn('[50]', general)
+        self.assertIn("60\nor more distinct rules", general)
+        self.assertIn("involving 2 to 4 columns", general)
         self.assertIn("BuckGPT_Intel", general)
         self.assertNotIn("BuckGPT_Intel", policy)
 
@@ -106,7 +109,8 @@ class ReferenceDocumentTests(unittest.TestCase):
             nullable=True,
         )]
         df.limit.return_value.collect.return_value = [
-            SimpleNamespace(asDict=lambda recursive: {"balance": 12.5})
+            SimpleNamespace(asDict=lambda recursive, number=number: {"balance": number})
+            for number in range(51)
         ]
         with patch("databuck.agentic_rules._generate_and_audit_with_gemini",
                    return_value=("[]", "[]")) as generate, \
@@ -115,9 +119,11 @@ class ReferenceDocumentTests(unittest.TestCase):
                 "gemini_api_key": "test-key", "domain_name": "banking",
             }), [])
         kwargs = generate.call_args.kwargs
-        self.assertIn('"rows": [[12.5]]', kwargs["prompt"])
-        self.assertIn('"rows": [[12.5]]', kwargs["general_prompt"])
-        df.limit.assert_called_once_with(10)
+        self.assertIn('[9]]}', kwargs["prompt"])
+        self.assertNotIn('[10]', kwargs["prompt"])
+        self.assertIn('[49]]}', kwargs["general_prompt"])
+        self.assertNotIn('[50]', kwargs["general_prompt"])
+        df.limit.assert_called_once_with(50)
 
     def test_policy_and_general_candidates_share_audit(self):
         policy_rule = {
