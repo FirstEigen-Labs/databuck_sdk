@@ -194,6 +194,28 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertIn("Do not reject the rule\n  merely because sql is now nonempty",
                       _build_audit_prompt("policy and general prompts", parsed))
 
+    def test_general_null_checks_are_rejected_without_affecting_policy_rules(self):
+        general_null = {
+            "name": "Loan amount present", "description": "Loan amount is required.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Loan amount is fundamental.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE loan_amnt IS NULL",
+        }
+        policy_null = dict(general_null, source_document="policy.pdf",
+                           reference_context="Loan amount is required.")
+        conditional = dict(general_null, name="Conditional term",
+                           sql="SELECT * FROM {{DATAFRAME}} WHERE "
+                               "funded_amnt > 0 AND term IS NULL")
+        reasons = []
+        parsed = _parse_rules(json.dumps([
+            general_null,
+            dict(general_null, sql="SELECT * FROM {{DATAFRAME}} WHERE "
+                                   "(`funded_amnt` IS NULL OR term IS NULL)"),
+            policy_null, conditional,
+        ]), {"BuckGPT_Intel", "policy.pdf"}, reasons)
+        self.assertEqual(parsed, [policy_null, conditional])
+        self.assertIn("BuckGPT_Intel standalone null checks are not allowed", reasons)
+
     def test_discovered_rule_prints_its_document_source(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "banking_policy.pdf"

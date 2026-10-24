@@ -272,6 +272,9 @@ or meaningful combination of key columns. Do not create routine ID null
 checks, duplicate policy rules, or invented thresholds, formats, categories,
 or relationships. Do not infer a uniqueness contract merely because values in
 50 rows differ. Do not require uniqueness of values that can legitimately recur.
+Do not create standalone null checks for any column, including amounts, dates,
+terms, and identifiers. DataBuck auto-discovery already handles null checks.
+Do not claim a column is mandatory solely to justify an IS NULL rule.
 
 Return a JSON array. Each row-level rule must have these string fields: name,
 description, source_document, reference_context, sql. Set source_document to
@@ -551,7 +554,8 @@ Pass a rule only when all conditions are true:
   Its rationale must explain a defensible business check grounded in the
   schema and domain. Sample rows can clarify meaning but cannot establish
   universal non-negativity, uniqueness, or cross-column requirements alone.
-  Reject speculative constraints and simple ID null checks.
+  Reject speculative constraints and standalone null checks on any column for
+  BuckGPT_Intel, even when the rationale calls that column fundamental.
 - A BuckGPT_Intel uniqueness check has check_type "uniqueness", key columns
   from the schema, and a dataset-level SQL query that returns duplicate key
   groups. Pass it only when its key has a convincing business identity
@@ -680,6 +684,20 @@ def _uniqueness_sql(columns: list[str]) -> str:
                 keys, DATAFRAME_PLACEHOLDER, present, keys)
 
 
+def _is_standalone_null_check(sql: str) -> bool:
+    match = re.fullmatch(
+        r"SELECT\s+\*\s+FROM\s+\{\{DATAFRAME\}\}\s+WHERE\s+(.+?)\s*;?",
+        sql.strip(), flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return False
+    identifier = r'(?:`(?:``|[^`])+`|"(?:""|[^"])+"|[A-Za-z_][A-Za-z0-9_]*)'
+    remaining, count = re.subn(rf"{identifier}\s+IS\s+NULL", "", match.group(1),
+                               flags=re.IGNORECASE)
+    return bool(count) and not re.sub(r"\b(?:AND|OR)\b|[\s()]", "", remaining,
+                                      flags=re.IGNORECASE)
+
+
 def _parse_rules(response_text: str, allowed_sources: set[str],
                  rejection_reasons: list[str] | None = None,
                  schema_columns: list[str] | None = None) -> list[dict[str, Any]]:
@@ -756,6 +774,10 @@ def _parse_rules(response_text: str, allowed_sources: set[str],
         if re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|DROP|CREATE|ALTER|CALL)\b", sql, re.IGNORECASE):
             if rejection_reasons is not None:
                 rejection_reasons.append("SQL contains a forbidden statement")
+            continue
+        if source_document == INTEL_SOURCE and _is_standalone_null_check(sql):
+            if rejection_reasons is not None:
+                rejection_reasons.append("BuckGPT_Intel standalone null checks are not allowed")
             continue
         rules.append(
             {
