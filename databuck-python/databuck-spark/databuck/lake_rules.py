@@ -1,5 +1,6 @@
 """Export profile-discovered row rules as Databricks expectations."""
 
+import hashlib
 import json
 import math
 import os
@@ -25,6 +26,7 @@ _PROFILE_METADATA_PARAMETERS = {
     "Date Rule": ("dateFormat",),
     "Value Anomaly Check": ("columns",),
 }
+_CRITICAL_SELECTION_CACHE = {}
 
 
 class DiscoveredRules(list):
@@ -191,7 +193,6 @@ class DiscoveredRules(list):
 
         auto_expectation_names = set(expectations)
         auto_expectation_count = len(expectations)
-        buckgpt_metadata = {}
         dataset_checks = {}
         for index, rule in enumerate(context_rules or (), start=1):
             name = "BuckGPT_Rule_{:03d}".format(index)
@@ -216,34 +217,25 @@ class DiscoveredRules(list):
                     "columns": rule.get("columns"),
                     "sql": rule.get("sql"),
                 }
-                # Include dataset checks in the same critical-selection review.
                 expectations[name] = rule["sql"]
             else:
                 expectations[name] = _context_rule_expectation(rule, name)
-            buckgpt_metadata[name] = {
-                "name": rule.get("name"),
-                "description": rule.get("description"),
-                "source_document": rule.get("source_document"),
-                "reference_context": rule.get("reference_context"),
-                "check_type": rule.get("check_type", "row"),
-                ("dataset_check_sql" if name in dataset_checks else "invalid_row_sql"):
-                    rule.get("sql"),
-            }
-        if isinstance(context, dict) and "domain_name" in context and expectations:
+        auto_candidates = {name: expression for name, expression in expectations.items()
+                           if name in auto_expectation_names}
+        if isinstance(context, dict) and "domain_name" in context and auto_candidates:
             if df is None:
                 raise ValueError("A DataFrame is required to select critical rules")
-            print("DataBuck: selecting critical rules (from {} auto-discovered rules, "
-                  "{} BuckGPT candidates)".format(len(self), len(buckgpt_metadata)),
-                  flush=True)
+            print("DataBuck: selecting critical auto-discovered rules "
+                  "(from {} discovered rules)".format(len(self)), flush=True)
             selected = _select_critical_expectations(
-                expectations, df, context, _profile_rule_metadata(self, expectations),
-                buckgpt_metadata,
+                auto_candidates, df, context, _profile_rule_metadata(self, auto_candidates),
             )
             expectations = {name: expression for name, expression in expectations.items()
-                            if name in selected}
-            print("DataBuck: selected {} auto-discovered and {} BuckGPT critical rules".format(
-                len(auto_expectation_names.intersection(expectations)),
-                sum(name in expectations for name in buckgpt_metadata)), flush=True)
+                            if name not in auto_expectation_names or name in selected}
+            print("DataBuck: selected {} critical auto-discovered rules; "
+                  "retaining {} audited BuckGPT rules".format(
+                      len(auto_expectation_names.intersection(expectations)),
+                      len(context_rules or ())), flush=True)
         elif context_rules:
             print("DataBuck: exporting {} auto-discovered and {} BuckGPT rules "
                   "({} total)".format(auto_expectation_count, len(context_rules),
@@ -346,8 +338,7 @@ def _profile_rule_metadata(rules, expectations):
     return metadata
 
 
-def _select_critical_expectations(expectations, df, context, profile_metadata,
-                                  buckgpt_metadata=None):
+def _select_critical_expectations(expectations, df, context, profile_metadata):
     domain_name = context.get("domain_name")
     if not isinstance(domain_name, str) or not domain_name.strip():
         raise ValueError("context['domain_name'] must be a non-empty string")
@@ -366,16 +357,13 @@ def _select_critical_expectations(expectations, df, context, profile_metadata,
                                        "rule_count", "include_failed_rules", "domain_name"}}
     metadata_by_name = {item["expectation_name"]: item for item in profile_metadata
                         if item.get("expectation_name") in expectations}
-    buckgpt_metadata = buckgpt_metadata or {}
     candidates = [
         {"id": index, "name": name, "expression": expression,
-         "origin": "BuckGPT" if name in buckgpt_metadata else "auto-discovered",
-         "metadata": buckgpt_metadata[name] if name in buckgpt_metadata
-         else metadata_by_name.get(name)}
-        for index, (name, expression) in enumerate(expectations.items(), start=1)
+         "metadata": metadata_by_name.get(name)}
+        for index, (name, expression) in enumerate(sorted(expectations.items()), start=1)
     ]
     prompt = """Act as a {domain_name} subject matter expert and a database expert.
-Review the DataBuck auto-discovered and BuckGPT candidates below. Select only
+Review only the DataBuck auto-discovered candidates below. Select only
 the rules whose failure would materially affect business decisions, regulatory
 or policy compliance, financial correctness, customer outcomes, or the ability
 to use this dataset for its stated business purpose.
@@ -390,16 +378,11 @@ critical. Use the schema, discovery metadata, rule expression, and business
 context to judge impact. Do not infer a business requirement from a column
 name alone.
 
-Review each distinct SQL check from either origin. Retain it only when you can
+Review each distinct auto-discovered SQL check. Retain it only when you can
 identify a concrete business consequence if that exact check fails, supported
 by the supplied business context, schema, and candidate metadata. A profiling
 pattern or length learned from observed data is not automatically a business
-requirement. A BuckGPT rule passing its policy audit is not automatically
-business critical; use its reference or stated rationale and source to judge
-impact. Do not retain every rule merely because the domain is regulated.
-BuckGPT uniqueness checks are dataset-level duplicate-group queries. Assess
-their key rationale and business impact, but do not treat them as row-level
-Lakeflow expectations.
+requirement. Do not retain every rule merely because the domain is regulated.
 
 Prioritize the most consequential rules for this dataset's business purpose.
 Return the smallest defensible set that a business reviewer can examine and
@@ -427,14 +410,29 @@ Business context:
 DataFrame schema:
 {schema}
 
-Auto-discovered and audited BuckGPT candidates (no sample records):
+Auto-discovered candidates (no sample records):
 {candidates}
 """.format(
         domain_name=domain_name.strip(),
-        context=json.dumps(business_context, default=str, ensure_ascii=False),
+        context=json.dumps(business_context, default=str, ensure_ascii=False,
+                           sort_keys=True),
         schema=df.schema.json(),
-        candidates=json.dumps(candidates, default=str, ensure_ascii=False),
+        candidates=json.dumps(candidates, default=str, ensure_ascii=False,
+                              sort_keys=True),
     )
+    model = context.get("gemini_model", "gemini-2.5-flash")
+    cache_key = hashlib.sha256(
+        "{}\0{}\0{}".format(api_key, model, prompt).encode("utf-8")
+    ).hexdigest()
+    cached_priorities = _CRITICAL_SELECTION_CACHE.get(cache_key)
+    if cached_priorities is not None:
+        print("DataBuck: reusing critical auto-discovered rule selection for unchanged inputs",
+              flush=True)
+        for name, priority in cached_priorities.items():
+            print("DataBuck: critical auto-discovered rule [{}] {}".format(priority, name),
+                  flush=True)
+        return set(cached_priorities)
+
     client = genai.Client(api_key=api_key)
     config = types.GenerateContentConfig(
         temperature=0.0,
@@ -443,7 +441,7 @@ Auto-discovered and audited BuckGPT candidates (no sample records):
     retry_reason = None
     for attempt in range(2):
         response = client.models.generate_content(
-            model=context.get("gemini_model", "gemini-2.5-flash"),
+            model=model,
             contents=prompt if attempt == 0 else (
                 prompt + ("\nYour previous response was invalid: {}. "
                           "Return a JSON array of objects with valid integer id "
@@ -453,10 +451,11 @@ Auto-discovered and audited BuckGPT candidates (no sample records):
         )
         try:
             priorities = _parse_critical_profile_selection(response.text or "", expectations)
+            if len(_CRITICAL_SELECTION_CACHE) >= 32:
+                del _CRITICAL_SELECTION_CACHE[next(iter(_CRITICAL_SELECTION_CACHE))]
+            _CRITICAL_SELECTION_CACHE[cache_key] = priorities
             for name, priority in priorities.items():
-                rule_title = buckgpt_metadata.get(name, {}).get("name")
-                display_name = "{}: {}".format(name, rule_title) if rule_title else name
-                print("DataBuck: critical rule [{}] {}".format(priority, display_name),
+                print("DataBuck: critical auto-discovered rule [{}] {}".format(priority, name),
                       flush=True)
             return set(priorities)
         except ValueError as exc:
@@ -476,7 +475,7 @@ def _parse_critical_profile_selection(response_text, expectations):
     if not isinstance(result, list):
         raise ValueError("response must be a list of selected rule objects")
 
-    candidate_names = list(expectations)
+    candidate_names = sorted(expectations)
     priorities = {}
     for item in result:
         if not isinstance(item, dict):

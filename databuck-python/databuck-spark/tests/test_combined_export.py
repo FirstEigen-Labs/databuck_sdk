@@ -41,7 +41,7 @@ class CombinedExportTests(unittest.TestCase):
             self.assertIn("dataset_checks:", yaml_text)
             self.assertIn("duplicate_count", yaml_text)
 
-    def test_buckgpt_uniqueness_joins_critical_selection(self):
+    def test_buckgpt_uniqueness_bypasses_critical_selection(self):
         from databuck.agentic_rules import _uniqueness_sql
 
         check = {
@@ -55,16 +55,14 @@ class CombinedExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "checks.json"
             with patch("databuck.lake_rules._select_critical_expectations",
-                       return_value={"BuckGPT_Rule_001"}) as select, \
+                       return_value=set()) as select, \
                  patch("databuck.lake_rules._classify_actions_with_llm") as classify:
                 DiscoveredRules([]).to_lake(
                     str(destination), df=Mock(),
                     context={"domain_name": "banking", "gemini_api_key": "test-key"},
                     context_rules=[check],
                 )
-            self.assertIn("BuckGPT_Rule_001", select.call_args.args[0])
-            self.assertEqual(select.call_args.args[4]["BuckGPT_Rule_001"]
-                             ["check_type"], "uniqueness")
+            select.assert_not_called()
             classify.assert_not_called()
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8"))
                              ["dataset_checks"][0]["source_document"], "BuckGPT_Intel")
@@ -241,7 +239,7 @@ class CombinedExportTests(unittest.TestCase):
                 "fail": {"BuckGPT_Rule_001": "NOT COALESCE((account_id IS NULL), FALSE)"},
             })
 
-    def test_domain_selection_filters_both_rule_sources(self):
+    def test_domain_selection_filters_only_auto_discovered_rules(self):
         profiling_rules = DiscoveredRules([
             {"ruleType": "Null Check", "columnName": "technical_id",
              "parameters": {"nullThreshold": 0}},
@@ -262,24 +260,22 @@ class CombinedExportTests(unittest.TestCase):
                        return_value={"not_null_account_id"}) as select, \
                  patch("databuck.lake_rules._classify_actions_with_llm", return_value={
                      "not_null_account_id": {"action": "drop", "reason": "Business key"},
+                     "BuckGPT_Rule_001": {"action": "fail", "reason": "Policy control"},
                  }) as classify:
                 DataBuck.discover(object(), str(destination), context={
                     "gemini_api_key": "test-key", "domain_name": "banking",
                     "pdf_paths": [], "business_context": "Account records must be linkable",
                 })
             self.assertEqual(set(select.call_args.args[0]),
-                             {"not_null_technical_id", "not_null_account_id",
-                              "BuckGPT_Rule_001"})
+                             {"not_null_technical_id", "not_null_account_id"})
             self.assertEqual({item["column_name"] for item in select.call_args.args[3]},
                              {"technical_id", "account_id"})
-            self.assertEqual(select.call_args.args[4]["BuckGPT_Rule_001"]["source_document"],
-                             "banking_policy.pdf")
             self.assertEqual(set(classify.call_args.args[0]),
-                             {"not_null_account_id"})
+                             {"not_null_account_id", "BuckGPT_Rule_001"})
             exported = json.loads(destination.read_text(encoding="utf-8"))
             self.assertNotIn("not_null_technical_id", str(exported))
             self.assertIn("not_null_account_id", exported["drop"])
-            self.assertNotIn("BuckGPT_Rule_001", str(exported))
+            self.assertIn("BuckGPT_Rule_001", exported["fail"])
 
     def test_domain_selection_can_leave_only_buckgpt_rules_in_yaml(self):
         profiling_rules = DiscoveredRules([{
@@ -295,13 +291,14 @@ class CombinedExportTests(unittest.TestCase):
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
                  patch.object(DataBuck, "_discover_context_rules", return_value=buckgpt_rules), \
                  patch("databuck.lake_rules._select_critical_expectations",
-                       return_value={"BuckGPT_Rule_001"}), \
+                       return_value=set()) as select, \
                  patch("databuck.lake_rules._classify_actions_with_llm") as classify:
                 DataBuck.discover(object(), str(destination), context={
                     "domain_name": "banking", "gemini_api_key": "test-key",
                     "business_context": "Balances must not be negative",
                 })
             classify.assert_not_called()
+            self.assertEqual(set(select.call_args.args[0]), {"not_null_technical_id"})
             output = destination.read_text(encoding="utf-8")
             self.assertNotIn("not_null_technical_id", output)
             self.assertIn("BuckGPT_Rule_001", output)

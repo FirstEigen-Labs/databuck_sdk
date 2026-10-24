@@ -160,11 +160,16 @@ Lakeflow expectations; the export contains only those that can be converted.
 Each printed BuckGPT rule shows either its supporting document and reference
 quote or `BuckGPT_Intel` and its general business rationale.
 The exported JSON and YAML files contain the rule conditions. When
-`domain_name` is supplied, business-critical selection applies to both
-auto-discovered and BuckGPT rules. The notebook prints the retained count for
-each source and each selected rule's HIGH, MEDIUM, or LOW business priority.
+`domain_name` is supplied, business-critical selection applies only to
+exportable auto-discovered rules. Audited BuckGPT rules bypass this reduction
+and remain in the export. The notebook prints the retained auto-discovered
+count and each selected rule's HIGH, MEDIUM, or LOW business priority.
 Priorities appear only in the notebook log, not in exported JSON or YAML.
 This selection has no fixed rule count.
+Within one notebook Python session, repeated selection with the same domain,
+business context, schema, model, and auto-discovered checks reuses the first
+result. Candidate IDs are stable even if discovery returns those checks in a
+different order. A new Python session makes a new Gemini selection.
 The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
 notebook driver. PDF files are uploaded to Gemini; text from Word documents is
 extracted locally and included in the generation and audit prompts. Images or
@@ -175,8 +180,8 @@ general-rule request. If the document request returns no rules, BuckGPT makes
 one focused document review attempt before proceeding. The first
 request creates rules supported by explicit document or Business context
 statements. The second creates useful inferred rules labeled `BuckGPT_Intel`.
-Both sets are audited together, then passed through critical selection and
-export. General rules can include non-negative and cross-column checks. When
+BuckGPT rules are audited and exported alongside the selected auto-discovered
+rules. General rules can include non-negative and cross-column checks. When
 BuckGPT identifies a defensible unique business key, the JSON or YAML export
 places its duplicate-group SQL in `dataset_checks`. Run these checks against
 the full dataset separately, replacing `{{DATAFRAME}}` with the source table
