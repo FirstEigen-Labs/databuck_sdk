@@ -345,6 +345,93 @@ class CombinedExportTests(unittest.TestCase):
             ) as stream:
                 self.assertEqual(len(list(csv.DictReader(stream))), 2)
 
+    def test_final_high_csv_contains_only_high_rules_from_both_sources(self):
+        profiling_rules = DiscoveredRules([
+            {"ruleType": "Null Check", "columnName": "account_id",
+             "parameters": {"nullThreshold": 0}},
+            {"ruleType": "Null Check", "columnName": "technical_id",
+             "parameters": {"nullThreshold": 0}},
+        ])
+        buckgpt_rules = [{
+            "name": "Funding cap", "description": "Investor funding is capped.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt_inv > funded_amnt",
+            "audit_status": "PASSED", "source_document": "policy.pdf",
+            "reference_context": "Investor funding cannot exceed total funding.",
+        }]
+
+        def select(expectations, df, context, metadata, priority_output):
+            priority_output.update({
+                "not_null_account_id": "HIGH",
+                "not_null_technical_id": "MEDIUM",
+                "BuckGPT_Rule_001": "HIGH",
+            })
+            return set(priority_output)
+
+        with tempfile.TemporaryDirectory() as directory:
+            for suffix in ("json", "yaml"):
+                destination = Path(directory) / ("expectations." + suffix)
+                with patch("databuck.lake_rules._identify_duplicate_expectations",
+                           return_value=set()), \
+                     patch("databuck.lake_rules._select_critical_expectations",
+                           side_effect=select), \
+                     patch("databuck.lake_rules._classify_actions_with_llm", return_value={
+                         "not_null_account_id": {"action": "drop", "reason": "Key"},
+                         "not_null_technical_id": {"action": "warn", "reason": "Technical"},
+                         "BuckGPT_Rule_001": {"action": "fail", "reason": "Policy"},
+                     }):
+                    profiling_rules.to_lake(
+                        str(destination), df=Mock(),
+                        context={"domain_name": "banking", "gemini_api_key": "test-key"},
+                        context_rules=buckgpt_rules,
+                    )
+                with destination.with_name("expectations_high_rules.csv").open(
+                    encoding="utf-8-sig", newline=""
+                ) as stream:
+                    high_rules = list(csv.DictReader(stream))
+                self.assertEqual({row["rule_name"] for row in high_rules},
+                                 {"not_null_account_id", "BuckGPT_Rule_001"})
+                self.assertEqual({row["priority"] for row in high_rules}, {"HIGH"})
+                self.assertEqual({row["source"] for row in high_rules},
+                                 {"AutoDiscovery", "BuckGPT"})
+                policy = next(row for row in high_rules
+                              if row["rule_name"] == "BuckGPT_Rule_001")
+                self.assertEqual(policy["source_document"], "policy.pdf")
+                self.assertIn("funded_amnt_inv > funded_amnt", policy["sql"])
+                self.assertEqual(policy["action"], "fail" if suffix == "json" else "")
+
+    def test_high_csv_includes_selected_dataset_uniqueness_check(self):
+        from databuck.agentic_rules import _uniqueness_sql
+
+        check = {
+            "name": "Unique loan ID", "description": "One row per loan.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Loan ID identifies a loan.",
+            "check_type": "uniqueness", "columns": ["loan_id"],
+            "sql": _uniqueness_sql(["loan_id"]),
+            "audit_status": "PASSED", "audit_reason": "Key is justified.",
+        }
+
+        def select(expectations, df, context, metadata, priority_output):
+            priority_output["BuckGPT_Rule_001"] = "HIGH"
+            return {"BuckGPT_Rule_001"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "checks.json"
+            with patch("databuck.lake_rules._select_critical_expectations",
+                       side_effect=select):
+                DiscoveredRules([]).to_lake(
+                    str(destination), df=Mock(),
+                    context={"domain_name": "banking", "gemini_api_key": "test-key"},
+                    context_rules=[check],
+                )
+            with destination.with_name("checks_high_rules.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as stream:
+                high_rules = list(csv.DictReader(stream))
+            self.assertEqual(len(high_rules), 1)
+            self.assertEqual(high_rules[0]["rule_type"], "uniqueness")
+            self.assertEqual(high_rules[0]["sql"], check["sql"])
+
     def test_domain_selection_can_leave_only_buckgpt_rules_in_yaml(self):
         profiling_rules = DiscoveredRules([{
             "ruleType": "Null Check", "columnName": "technical_id",

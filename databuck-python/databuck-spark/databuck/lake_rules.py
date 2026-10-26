@@ -1,5 +1,6 @@
 """Export profile-discovered row rules as Databricks expectations."""
 
+import csv
 import hashlib
 import json
 import math
@@ -221,6 +222,7 @@ class DiscoveredRules(list):
                 expectations[name] = rule["sql"]
             else:
                 expectations[name] = _context_rule_expectation(rule, name)
+        critical_priorities = None
         if isinstance(context, dict) and "domain_name" in context and expectations:
             if df is None:
                 raise ValueError("A DataFrame is required to select critical rules")
@@ -229,11 +231,13 @@ class DiscoveredRules(list):
             for index, rule in enumerate(context_rules or (), start=1):
                 name = "BuckGPT_Rule_{:03d}".format(index)
                 buckgpt_metadata[name] = {
+                    "rule_name": rule.get("name"),
                     "source_document": rule.get("source_document"),
                     "reference_context": rule.get("reference_context"),
                     "description": rule.get("description"),
                     "check_type": rule.get("check_type") or "row",
                     "columns": rule.get("columns"),
+                    "sql": rule.get("sql"),
                 }
                 metadata.append({"expectation_name": name, **buckgpt_metadata[name]})
             if len(expectations) > 1:
@@ -251,8 +255,10 @@ class DiscoveredRules(list):
                   "{} BuckGPT candidates)".format(
                       len(auto_expectation_names.intersection(expectations)),
                       len(set(expectations) - auto_expectation_names)), flush=True)
+            critical_priorities = {}
             selected = _select_critical_expectations(
                 expectations, df, context, metadata,
+                priority_output=critical_priorities,
             )
             expectations = {name: expression for name, expression in expectations.items()
                             if name in selected}
@@ -273,10 +279,16 @@ class DiscoveredRules(list):
             raise ValueError("No Databricks expectations are available to export")
         if export_format == "yaml":
             self.action_decisions = {}
-            return write_expectations(
+            output_path = write_expectations(
                 expectations, path_where_needs_to_export, table_name=table_name,
                 dataset_checks=dataset_checks,
             )
+            if critical_priorities is not None:
+                _write_high_priority_csv(
+                    output_path, critical_priorities, expectations, dataset_checks,
+                    auto_expectation_names, metadata, {},
+                )
+            return output_path
         if context is None:
             decisions = {name: {"action": "warn", "reason": "No action classification requested."}
                          for name in expectations}
@@ -293,9 +305,55 @@ class DiscoveredRules(list):
         for name, expression in expectations.items():
             grouped[decisions[name]["action"]][name] = expression
         self.action_decisions = decisions
-        return write_expectations(
+        output_path = write_expectations(
             grouped, path_where_needs_to_export, dataset_checks=dataset_checks,
         )
+        if critical_priorities is not None:
+            _write_high_priority_csv(
+                output_path, critical_priorities, expectations, dataset_checks,
+                auto_expectation_names, metadata, decisions,
+            )
+        return output_path
+
+
+def _write_high_priority_csv(output_path, priorities, expectations, dataset_checks,
+                             auto_expectation_names, metadata, decisions):
+    csv_path = Path(output_path).with_name(
+        "{}_high_rules.csv".format(Path(output_path).stem)
+    )
+    metadata_by_name = {item["expectation_name"]: item for item in metadata}
+    fieldnames = (
+        "rule_name", "priority", "source", "rule_type", "column_name",
+        "description", "source_document", "reference_context", "expression",
+        "sql", "action", "action_reason",
+    )
+    high_names = [name for name in sorted(priorities)
+                  if priorities[name] == "HIGH"
+                  and (name in expectations or name in dataset_checks)]
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        for name in high_names:
+            rule_metadata = metadata_by_name.get(name) or {}
+            decision = decisions.get(name) or {}
+            writer.writerow({
+                "rule_name": name,
+                "priority": "HIGH",
+                "source": ("AutoDiscovery" if name in auto_expectation_names
+                           else "BuckGPT"),
+                "rule_type": (rule_metadata.get("rule_type")
+                              or rule_metadata.get("check_type")),
+                "column_name": rule_metadata.get("column_name"),
+                "description": rule_metadata.get("description"),
+                "source_document": rule_metadata.get("source_document"),
+                "reference_context": rule_metadata.get("reference_context"),
+                "expression": expectations.get(name),
+                "sql": rule_metadata.get("sql") or dataset_checks.get(name, {}).get("sql"),
+                "action": decision.get("action"),
+                "action_reason": decision.get("reason"),
+            })
+    print("DataBuck: saved {} HIGH-priority rules to {}".format(
+        len(high_names), csv_path), flush=True)
 
 
 def _context_rule_expectation(rule, name):
@@ -462,8 +520,8 @@ Candidates (no sample records): {candidates}
     for attempt in range(2):
         response = client.models.generate_content(
             model=model,
-            contents=prompt if attempt == 0 else (
-                prompt + "\nYour previous response was invalid: {}. Return only "
+            contents=prompt if attempt == 0 else prompt + (
+                "\nYour previous response was invalid: {}. Return only "
                 "valid candidate IDs and a reason for each duplicate pair."
             ).format(retry_reason),
             config=config,
@@ -482,7 +540,8 @@ Candidates (no sample records): {candidates}
     return set()
 
 
-def _select_critical_expectations(expectations, df, context, profile_metadata):
+def _select_critical_expectations(expectations, df, context, profile_metadata,
+                                  priority_output=None):
     domain_name = context.get("domain_name")
     if not isinstance(domain_name, str) or not domain_name.strip():
         raise ValueError("context['domain_name'] must be a non-empty string")
@@ -609,6 +668,8 @@ Auto-discovered and BuckGPT candidates (no sample records):
     ).hexdigest()
     cached_priorities = _CRITICAL_SELECTION_CACHE.get(cache_key)
     if cached_priorities is not None:
+        if priority_output is not None:
+            priority_output.update(cached_priorities)
         print("DataBuck: reusing critical rule selection for unchanged inputs",
               flush=True)
         for name, priority in cached_priorities.items():
@@ -637,6 +698,8 @@ Auto-discovered and BuckGPT candidates (no sample records):
             if len(_CRITICAL_SELECTION_CACHE) >= 32:
                 del _CRITICAL_SELECTION_CACHE[next(iter(_CRITICAL_SELECTION_CACHE))]
             _CRITICAL_SELECTION_CACHE[cache_key] = priorities
+            if priority_output is not None:
+                priority_output.update(priorities)
             for name, priority in priorities.items():
                 print("DataBuck: critical rule [{}] {}".format(priority, name),
                       flush=True)
@@ -676,6 +739,38 @@ def _parse_critical_profile_selection(response_text, expectations):
     return priorities
 
 
+def _parse_rule_action_overrides(response_text, candidate_names):
+    try:
+        decisions = json.loads(response_text.strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError("response is not valid JSON") from exc
+    if not isinstance(decisions, list):
+        raise ValueError("response must be a list of rule actions")
+    overrides = {}
+    seen_ids = set()
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            raise ValueError("each rule action must be an object")
+        rule_id = decision.get("id")
+        action = decision.get("action")
+        reason = decision.get("reason")
+        if type(rule_id) is not int or not 1 <= rule_id <= len(candidate_names):
+            raise ValueError("rule action ID is outside the available range")
+        if rule_id in seen_ids:
+            raise ValueError("duplicate rule action ID: {}".format(rule_id))
+        seen_ids.add(rule_id)
+        if not isinstance(action, str) or action.strip().lower() not in _ACTIONS:
+            raise ValueError("rule action must be warn, drop, or fail")
+        action = action.strip().lower()
+        if action == "warn":
+            continue
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("drop or fail action needs a reason")
+        overrides[rule_id] = {"action": action, "reason": reason.strip()}
+    return {candidate_names[rule_id - 1]: decision
+            for rule_id, decision in overrides.items()}
+
+
 def _classify_actions_with_llm(expectations, df, context):
     if isinstance(context, str):
         context = {"business_context": context}
@@ -696,9 +791,12 @@ def _classify_actions_with_llm(expectations, df, context):
     business_context = {key: value for key, value in context.items()
                         if key not in {"gemini_api_key", "gemini_model", "pdf_paths",
                                        "rule_count", "include_failed_rules"}}
-    prompt = """Classify each DataBuck row expectation for a Databricks pipeline.
-Return only a JSON array with one object for every expectation, containing
-exactly: name, action, reason. Use the exact expectation names provided.
+    candidate_names = sorted(expectations)
+    candidates = [{"id": index, "name": name, "expression": expectations[name]}
+                  for index, name in enumerate(candidate_names, start=1)]
+    prompt = """Classify DataBuck row expectations for a Databricks pipeline.
+Return only rules that require drop or fail. Every omitted rule defaults to warn.
+Use the numeric candidate IDs below, not rule names, in your response.
 
 Allowed actions:
 - warn: keep invalid rows and record quality metrics.
@@ -707,11 +805,14 @@ Allowed actions:
   unacceptable.
 
 Decide from the expectation meaning, column names and types, the DataFrame
-sample, and any optional business context. Use your judgment to choose the
-appropriate action for each rule. A small sample does not establish business
-criticality by itself. Choose warn if the evidence does not justify drop or
-fail; reserve fail for violations that should stop the entire update.
-Do not change, omit, or invent rules. Explain each choice in reason.
+sample, and any optional business context. A small sample does not establish
+business criticality by itself. HIGH business priority does not automatically
+justify fail. Omit a rule unless the evidence clearly justifies drop or fail;
+reserve fail for violations that should stop the entire update. Do not invent
+rules or IDs. Return a JSON array of objects with integer id, action (drop or
+fail), and a nonempty reason. For example:
+[{{"id": 2, "action": "fail", "reason": "A required control"}}]
+Return [] when all rules should warn. Do not repeat any ID.
 
 Business context:
 {context}
@@ -722,44 +823,43 @@ DataFrame schema:
 DataFrame sample (up to five rows):
 {sample}
 
-Discovered expectations:
-{expectations}
+Candidate expectations:
+{candidates}
 """.format(
         context=json.dumps(business_context, default=str, ensure_ascii=False),
         schema=df.schema.json(),
         sample=json.dumps(sample, default=str, ensure_ascii=False),
-        expectations=json.dumps(expectations, ensure_ascii=False),
+        candidates=json.dumps(candidates, ensure_ascii=False),
     )
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=context.get("gemini_model", "gemini-2.5-flash"),
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        temperature=0.0, response_mime_type="application/json",
     )
-    try:
-        decisions = json.loads((response.text or "").strip())
-    except json.JSONDecodeError as exc:
-        raise ValueError("Gemini returned invalid JSON for rule actions") from exc
-    if not isinstance(decisions, list):
-        raise ValueError("Gemini must return a list of rule actions")
-
-    by_name = {}
-    for decision in decisions:
-        if not isinstance(decision, dict):
-            raise ValueError("Gemini returned an invalid rule action")
-        name = decision.get("name")
-        action = str(decision.get("action", "")).strip().lower()
-        reason = str(decision.get("reason", "")).strip()
-        if (not isinstance(name, str) or name not in expectations
-                or name in by_name or action not in _ACTIONS or not reason):
-            raise ValueError("Gemini returned an unknown, duplicate, or invalid rule action")
-        by_name[name] = {"action": action, "reason": reason}
-    if set(by_name) != set(expectations):
-        raise ValueError("Gemini did not classify every exported rule")
-    return by_name
+    retry_reason = None
+    for attempt in range(2):
+        response = client.models.generate_content(
+            model=context.get("gemini_model", "gemini-2.5-flash"),
+            contents=prompt if attempt == 0 else prompt + (
+                "\nYour previous response was invalid: {}. Return only "
+                "valid numeric IDs with drop or fail and a reason."
+            ).format(retry_reason),
+            config=config,
+        )
+        try:
+            overrides = _parse_rule_action_overrides(response.text or "",
+                                                     candidate_names)
+            break
+        except ValueError as exc:
+            retry_reason = str(exc)
+    else:
+        print("DataBuck: action review invalid after one retry; assigning warn "
+              "to all rules ({})".format(retry_reason), flush=True)
+        overrides = {}
+    decisions = {name: {"action": "warn",
+                        "reason": "No stronger action was justified by the action review."}
+                 for name in candidate_names}
+    decisions.update(overrides)
+    return decisions
 
 
 def _value_anomaly_specs(rules):

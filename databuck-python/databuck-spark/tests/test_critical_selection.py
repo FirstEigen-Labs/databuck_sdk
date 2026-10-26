@@ -12,6 +12,7 @@ os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
 from databuck.agentic_rules import has_rule_reference_context
 from databuck.lake_rules import (
     _CRITICAL_SELECTION_CACHE, _DUPLICATE_SELECTION_CACHE,
+    _classify_actions_with_llm, _parse_rule_action_overrides,
     _identify_duplicate_expectations, _parse_duplicate_selection,
     _profile_rule_metadata, _select_critical_expectations,
 )
@@ -116,6 +117,31 @@ class CriticalSelectionTests(unittest.TestCase):
                       output.getvalue())
         self.client.models.generate_content.assert_called_once()
 
+    def test_selection_provides_priorities_for_fresh_and_cached_results(self):
+        self.client.models.generate_content.return_value.text = (
+            '[{"id":1,"priority":"HIGH"},'
+            '{"id":2,"priority":"MEDIUM"}]'
+        )
+        first_priorities = {}
+        cached_priorities = {}
+        context = {"domain_name": "banking", "gemini_api_key": "test-key"}
+        with patch.dict(sys.modules, self.modules), contextlib.redirect_stdout(io.StringIO()):
+            first = _select_critical_expectations(
+                self.expectations, self.df, context, self.metadata,
+                priority_output=first_priorities,
+            )
+            cached = _select_critical_expectations(
+                self.expectations, self.df, context, self.metadata,
+                priority_output=cached_priorities,
+            )
+        self.assertEqual(first, cached)
+        self.assertEqual(first_priorities, {
+            "not_null_account_id": "HIGH",
+            "not_null_technical_id": "MEDIUM",
+        })
+        self.assertEqual(cached_priorities, first_priorities)
+        self.client.models.generate_content.assert_called_once()
+
     def test_selection_accepts_candidate_ids(self):
         self.client.models.generate_content.return_value.text = '[{"id":1,"priority":"LOW"}]'
         with patch.dict(sys.modules, self.modules):
@@ -183,6 +209,81 @@ class CriticalSelectionTests(unittest.TestCase):
                 '[{"remove_id": 1, "keep_id": 2, "reason": "same key"}]',
                 ["dataset_check", "row_check"], {"dataset_check"},
             )
+
+    def test_action_review_uses_ids_and_defaults_omitted_rules_to_warn(self):
+        self.df.limit.return_value.toJSON.return_value.collect.return_value = [
+            '{"account_id":"A"}'
+        ]
+        self.client.models.generate_content.return_value.text = (
+            '[{"id":1,"action":"fail","reason":"Critical key"}]'
+        )
+        with patch.dict(sys.modules, self.modules):
+            decisions = _classify_actions_with_llm(
+                self.expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+            )
+        self.assertEqual(decisions["not_null_account_id"]["action"], "fail")
+        self.assertEqual(decisions["not_null_technical_id"]["action"], "warn")
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn('"id": 1', prompt)
+        self.assertIn("Every omitted rule defaults to warn", prompt)
+        self.assertNotIn("test-key", prompt)
+
+    def test_action_review_retries_invalid_ids(self):
+        self.df.limit.return_value.toJSON.return_value.collect.return_value = []
+        self.client.models.generate_content.side_effect = [
+            SimpleNamespace(text='[{"id":3,"action":"fail","reason":"Wrong"}]'),
+            SimpleNamespace(text='[{"id":2,"action":"drop","reason":"Fix row"}]'),
+        ]
+        with patch.dict(sys.modules, self.modules):
+            decisions = _classify_actions_with_llm(
+                self.expectations, self.df, {"gemini_api_key": "test-key"},
+            )
+        self.assertEqual(decisions["not_null_technical_id"]["action"], "drop")
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_action_review_falls_back_to_warn_after_invalid_retry(self):
+        self.df.limit.return_value.toJSON.return_value.collect.return_value = []
+        self.client.models.generate_content.return_value.text = (
+            '[{"id":1,"action":"fail","reason":"A"},'
+            '{"id":1,"action":"drop","reason":"B"}]'
+        )
+        output = io.StringIO()
+        with patch.dict(sys.modules, self.modules), contextlib.redirect_stdout(output):
+            decisions = _classify_actions_with_llm(
+                self.expectations, self.df, {"gemini_api_key": "test-key"},
+            )
+        self.assertEqual({value["action"] for value in decisions.values()}, {"warn"})
+        self.assertIn("action review invalid after one retry", output.getvalue())
+
+    def test_action_review_rejects_duplicate_ids(self):
+        with self.assertRaisesRegex(ValueError, "duplicate rule action ID"):
+            _parse_rule_action_overrides(
+                '[{"id":1,"action":"drop","reason":"A"},'
+                '{"id":1,"action":"fail","reason":"B"}]',
+                ["rule_one", "rule_two"],
+            )
+
+    def test_action_review_accepts_explicit_warn(self):
+        self.assertEqual(_parse_rule_action_overrides(
+            '[{"id":1,"action":"warn"},'
+            '{"id":2,"action":"fail","reason":"Required control"}]',
+            ["rule_one", "rule_two"],
+        ), {"rule_two": {"action": "fail", "reason": "Required control"}})
+
+    def test_duplicate_review_retries_invalid_ids(self):
+        self.client.models.generate_content.side_effect = [
+            SimpleNamespace(text='[{"remove_id":3,"keep_id":1,"reason":"same"}]'),
+            SimpleNamespace(text='[]'),
+        ]
+        with patch.dict(sys.modules, self.modules):
+            removed = _identify_duplicate_expectations(
+                self.expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                self.metadata, set(self.expectations),
+            )
+        self.assertEqual(removed, set())
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
 
     def test_identical_candidates_reuse_selection_even_when_order_changes(self):
         self.client.models.generate_content.return_value.text = '[{"id":1,"priority":"HIGH"}]'
