@@ -14,11 +14,13 @@ os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
 
 from databuck.agentic_rules import (
     _build_audit_prompt,
+    _build_cross_column_prompt,
     _build_general_prompt,
     _build_prompt,
     _get_reference_paths,
     _generate_and_audit_with_gemini,
     _parse_rules,
+    _referenced_schema_columns,
     _read_docx_text,
     _sample_rows,
     discover_rules,
@@ -91,6 +93,9 @@ class ReferenceDocumentTests(unittest.TestCase):
         context = {"domain_name": "banking"}
         policy = _build_prompt(df, context, [], [], sample_rows=rows[:10])
         general = _build_general_prompt(df, context, rows)
+        cross_column = _build_cross_column_prompt(
+            df, context, rows, [], [], {"BuckGPT_Intel"},
+        )
         self.assertIn('"columns": ["balance"]', policy)
         self.assertIn('"rows": [[0], [1]', policy)
         self.assertIn('[9]]}', policy)
@@ -102,6 +107,9 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertIn("non-positive checks where positive values are semantically impossible", general)
         self.assertIn("do not assume all amounts, counts, balances, or adjustments", general)
         self.assertIn("BuckGPT_Intel", general)
+        self.assertIn("relationships\nbetween 2 to 5 DataFrame columns", cross_column)
+        self.assertIn('[49]]}', cross_column)
+        self.assertIn("Never invent numeric bounds, tolerances", cross_column)
         self.assertNotIn("BuckGPT_Intel", policy)
 
     def test_discover_sends_sample_to_both_generation_phases(self):
@@ -124,8 +132,30 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertIn('[9]]}', kwargs["prompt"])
         self.assertNotIn('[10]', kwargs["prompt"])
         self.assertIn('[49]]}', kwargs["general_prompt"])
+        self.assertIn('[49]]}', kwargs["cross_column_prompt"])
         self.assertNotIn('[50]', kwargs["general_prompt"])
         df.limit.assert_called_once_with(50)
+
+    def test_cross_column_prompt_includes_policy_sources_without_api_key(self):
+        df = Mock()
+        df.schema.fields = [SimpleNamespace(
+            name="funded_amnt_inv",
+            dataType=SimpleNamespace(simpleString=lambda: "double"),
+            nullable=True,
+        )]
+        prompt = _build_cross_column_prompt(
+            df,
+            {"domain_name": "banking", "gemini_api_key": "secret-key",
+             "business_context": "Investor funding cannot exceed total funding."},
+            [{"funded_amnt_inv": 10}], ["/some/policy.pdf"],
+            [{"name": "terms.docx", "text": "Funding must reconcile."}],
+            {"policy.pdf", "terms.docx", "business_context", "BuckGPT_Intel"},
+        )
+        self.assertIn("policy.pdf", prompt)
+        self.assertIn("Funding must reconcile.", prompt)
+        self.assertIn("Investor funding cannot exceed total funding.", prompt)
+        self.assertIn("BuckGPT_Intel", prompt)
+        self.assertNotIn("secret-key", prompt)
 
     def test_policy_and_general_candidates_share_audit(self):
         policy_rule = {
@@ -170,6 +200,76 @@ class ReferenceDocumentTests(unittest.TestCase):
                       calls[2].kwargs["contents"][0])
         self.assertIn('"source_document": "BuckGPT_Intel"',
                       calls[2].kwargs["contents"][0])
+
+    def test_dedicated_cross_column_call_uses_documents_and_shares_audit(self):
+        policy_rule = {
+            "name": "Required balance", "description": "Balance is required.",
+            "source_document": "policy.pdf", "reference_context": "Balance is required.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE balance IS NULL",
+        }
+        general_rule = {
+            "name": "Nonnegative balance", "description": "Balance cannot be negative.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Negative balances are invalid.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE balance < 0",
+        }
+        cross_rule = {
+            "name": "Investor funding cap",
+            "description": "Investor funding cannot exceed total funding.",
+            "source_document": "policy.pdf",
+            "reference_context": "Investor funding cannot exceed total funding.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt_inv > funded_amnt",
+        }
+        single_column_rule = {
+            "name": "Positive funded amount",
+            "description": "Funding must be positive.",
+            "source_document": "BuckGPT_Intel",
+            "reference_context": "BuckGPT_Intel: Funding must be positive.",
+            "sql": "SELECT * FROM {{DATAFRAME}} WHERE funded_amnt <= 0",
+        }
+        client = Mock()
+        uploaded = SimpleNamespace(name="uploaded-policy")
+        client.files.upload.return_value = uploaded
+        client.models.generate_content.side_effect = [
+            SimpleNamespace(text=json.dumps([policy_rule])),
+            SimpleNamespace(text=json.dumps([general_rule])),
+            SimpleNamespace(text=json.dumps([
+                policy_rule, cross_rule, single_column_rule,
+            ])),
+            SimpleNamespace(text=json.dumps([
+                {"rule_index": i, "audit_status": "PASSED", "audit_reason": "Valid."}
+                for i in (1, 2, 3)
+            ])),
+        ]
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = Mock(return_value=client)
+        genai.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+        google.genai = genai
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            response_text, _ = _generate_and_audit_with_gemini(
+                "test-key", "test-model", "policy prompt", ["/some/policy.pdf"],
+                {"policy.pdf", "BuckGPT_Intel"}, general_prompt="general prompt",
+                cross_column_prompt="cross-column prompt",
+                schema_columns=["balance", "funded_amnt", "funded_amnt_inv"],
+            )
+        self.assertEqual(json.loads(response_text),
+                         [policy_rule, general_rule, cross_rule])
+        calls = client.models.generate_content.call_args_list
+        self.assertEqual(len(calls), 4)
+        self.assertIn("cross-column prompt", calls[2].kwargs["contents"][0])
+        self.assertIn(general_rule["name"], calls[2].kwargs["contents"][0])
+        self.assertEqual(calls[2].kwargs["contents"][1:], [uploaded])
+        self.assertIn(cross_rule["name"], calls[3].kwargs["contents"][0])
+        client.files.delete.assert_called_once_with(name="uploaded-policy")
+
+    def test_cross_column_detection_ignores_string_literals(self):
+        columns = _referenced_schema_columns(
+            "SELECT * FROM {{DATAFRAME}} WHERE status = 'funded_amnt' "
+            "AND funded_amnt_inv > 0",
+            ["status", "funded_amnt", "funded_amnt_inv"],
+        )
+        self.assertEqual(columns, {"status", "funded_amnt_inv"})
 
     def test_general_uniqueness_uses_dataset_query_and_schema_columns(self):
         uniqueness = {

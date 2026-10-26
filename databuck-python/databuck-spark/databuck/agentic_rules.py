@@ -62,11 +62,16 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
     prompt = _build_prompt(df, context, reference_paths, word_documents,
                            sample_rows=general_sample_rows[:10])
     general_prompt = _build_general_prompt(df, context, general_sample_rows)
+    cross_column_prompt = _build_cross_column_prompt(
+        df, context, general_sample_rows, reference_paths, word_documents,
+        allowed_sources,
+    )
     response_text, audit_response_text = _generate_and_audit_with_gemini(
         api_key=api_key,
         model=context.get("gemini_model", DEFAULT_MODEL),
         prompt=prompt,
         general_prompt=general_prompt,
+        cross_column_prompt=cross_column_prompt,
         pdf_paths=pdf_paths,
         allowed_sources=allowed_sources,
         schema_columns=schema_columns,
@@ -306,10 +311,78 @@ Sample records (columns listed once, rows in the same order): {sample_rows}
     )
 
 
+def _build_cross_column_prompt(
+    df: Any, context: dict, sample_rows: list[dict[str, Any]],
+    reference_paths: list[str], word_documents: list[dict[str, str]],
+    allowed_sources: set[str],
+) -> str:
+    schema = [{"name": field.name, "type": field.dataType.simpleString(),
+               "nullable": field.nullable} for field in df.schema.fields]
+    business_context = {key: value for key, value in context.items()
+                        if key not in _CONTROL_CONTEXT_KEYS}
+    return """You are a {domain} subject matter expert and data engineer.
+Generate additional, high-value SQL rules specifically for relationships
+between 2 to 5 DataFrame columns. Examine the full schema and the supplied
+reference documents together. Look for conditional population, chronology,
+arithmetic reconciliation, subset or ordering constraints, and status-dependent
+relationships. Check all relevant columns in each relationship. Do not create
+single-column checks, standalone null checks, or uniqueness checks.
+
+First use explicit statements from the attached PDFs, Word document text, or
+Business context. For each document-backed rule, quote one exact supporting
+statement in reference_context and set source_document to the exact filename,
+or to "business_context" for an explicit Business context statement. A policy
+may use business terms rather than column names; map them only when the match
+to schema columns is unambiguous and explain the mapping in description.
+
+When no supplied statement supports a defensible general relationship, use
+source_document "BuckGPT_Intel" and begin reference_context with
+"BuckGPT_Intel: " followed by the business rationale. Sample values can
+clarify column meaning but cannot establish a universal requirement.
+Never invent numeric bounds, tolerances, formulas, date parsing conventions,
+statuses, or missing-value exceptions. Include an exact numeric tolerance or
+condition only when it is explicitly supported by a reference or Business
+context; otherwise omit that rule. Do not repeat the previously generated
+rules. Return [] if no additional defensible cross-column rule exists.
+
+Return only a JSON array of objects with string fields name, description,
+source_document, reference_context, and sql. Use only these exact source_document
+values: {sources}. Each sql must have exactly this form:
+SELECT * FROM {placeholder} WHERE <invalid-row condition>
+Use only supplied columns and generic SQL. No joins, aggregation, windows,
+subqueries, or extra statements. The condition must return invalid rows.
+
+Business domain: {domain}
+DataFrame schema: {schema}
+Business context: {context}
+Reference document names: {documents}
+Word document text: {word_documents}
+Up to 50 sample records (columns listed once, rows in the same order): {sample_rows}
+""".format(
+        domain=context.get("domain_name") or "Not provided",
+        schema=json.dumps(schema, default=str),
+        context=json.dumps(business_context, default=str, ensure_ascii=False),
+        documents=json.dumps([os.path.basename(path) for path in reference_paths]),
+        word_documents=json.dumps(word_documents, ensure_ascii=False),
+        sources=json.dumps(sorted(allowed_sources)),
+        placeholder=DATAFRAME_PLACEHOLDER,
+        sample_rows=_compact_sample_rows(df, sample_rows),
+    )
+
+
+def _referenced_schema_columns(sql: str, schema_columns: list[str]) -> set[str]:
+    without_literals = re.sub(r"'(?:''|[^'])*'", "''", sql)
+    return {column for column in schema_columns if re.search(
+        r"(?<![A-Za-z0-9_]){}(?![A-Za-z0-9_])".format(re.escape(column)),
+        without_literals, flags=re.IGNORECASE,
+    )}
+
+
 def _generate_and_audit_with_gemini(
     api_key: str, model: str, prompt: str, pdf_paths: list[str],
     allowed_sources: set[str],
     general_prompt: str | None = None,
+    cross_column_prompt: str | None = None,
     schema_columns: list[str] | None = None,
 ) -> tuple[str, str]:
     try:
@@ -334,15 +407,19 @@ def _generate_and_audit_with_gemini(
             for attempt in range(2):
                 generation_prompt = phase_prompt
                 if attempt:
-                    source_guidance = (
-                        "BuckGPT_Intel rules need a reference_context beginning "
-                        "'BuckGPT_Intel: ' with a clear business rationale. "
-                        "Uniqueness checks need check_type 'uniqueness', valid "
-                        "columns, and empty sql; row rules need SELECT SQL. "
-                        if phase_sources == {INTEL_SOURCE} else
-                        "Every rule needs a quoted reference_context from its "
-                        "named document or Business context. "
-                    )
+                    source_guidance = ""
+                    if INTEL_SOURCE in phase_sources:
+                        source_guidance += (
+                            "BuckGPT_Intel rules need a reference_context beginning "
+                            "'BuckGPT_Intel: ' with a clear business rationale. "
+                            "Uniqueness checks need check_type 'uniqueness', valid "
+                            "columns, and empty sql; row rules need SELECT SQL. "
+                        )
+                    if phase_sources - {INTEL_SOURCE}:
+                        source_guidance += (
+                            "Document or Business context rules need an exact quoted "
+                            "reference_context from the named source. "
+                        )
                     generation_prompt += (
                         "\nThe previous response contained no valid rules: {}. "
                         "Try again. Use only these exact source_document values: {}. "
@@ -450,6 +527,33 @@ def _generate_and_audit_with_gemini(
                 if sql_key not in seen_sql:
                     candidate_rules.append(rule)
                     seen_sql.add(sql_key)
+        if cross_column_prompt:
+            print("BuckGPT: generating additional cross-column rules", flush=True)
+            cross_phase_prompt = cross_column_prompt + (
+                "\nPreviously generated rules; do not duplicate them: {}"
+            ).format(json.dumps([
+                {"name": rule["name"], "sql": rule["sql"]}
+                for rule in candidate_rules
+            ]))
+            cross_rules, cross_rejections = generate_phase(
+                cross_phase_prompt, allowed_sources, uploaded_files,
+            )
+            rejection_reasons.extend(cross_rejections)
+            if schema_columns is not None:
+                cross_rules = [rule for rule in cross_rules
+                               if len(_referenced_schema_columns(
+                                   rule["sql"], schema_columns)) >= 2]
+            seen_sql = {rule["sql"].strip().rstrip(";").lower()
+                        for rule in candidate_rules}
+            added_cross_rules = 0
+            for rule in cross_rules:
+                sql_key = rule["sql"].strip().rstrip(";").lower()
+                if sql_key not in seen_sql:
+                    candidate_rules.append(rule)
+                    seen_sql.add(sql_key)
+                    added_cross_rules += 1
+            print("BuckGPT: added {} cross-column candidates".format(
+                added_cross_rules), flush=True)
         if not candidate_rules:
             if not rejection_reasons:
                 return "[]", "[]"
