@@ -262,8 +262,11 @@ domain, schema, and up to 50 sample records to understand the data, but do not
 mistake a sample pattern for a universal contract. Return [] when a rule could
 reject legitimate records.
 
-Consider non-negative checks for amounts or counts where negative values are
-semantically impossible. Systematically inspect related amount, count, status,
+Consider non-negative checks where negative values are semantically impossible,
+and non-positive checks where positive values are semantically impossible.
+For either direction, require a clear business rationale from the column meaning
+and domain; do not assume all amounts, counts, balances, or adjustments have
+the same sign constraint. Systematically inspect related amount, count, status,
 date, rate, and balance columns for meaningful cross-column relationships
 involving 2 to 4 columns. Create a rule only when the relationship follows
 clearly from the column meanings and business domain; explain its rationale.

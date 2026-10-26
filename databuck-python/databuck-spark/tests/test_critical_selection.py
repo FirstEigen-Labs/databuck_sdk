@@ -11,13 +11,16 @@ os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
 
 from databuck.agentic_rules import has_rule_reference_context
 from databuck.lake_rules import (
-    _CRITICAL_SELECTION_CACHE, _profile_rule_metadata, _select_critical_expectations,
+    _CRITICAL_SELECTION_CACHE, _DUPLICATE_SELECTION_CACHE,
+    _identify_duplicate_expectations, _parse_duplicate_selection,
+    _profile_rule_metadata, _select_critical_expectations,
 )
 
 
 class CriticalSelectionTests(unittest.TestCase):
     def setUp(self):
         _CRITICAL_SELECTION_CACHE.clear()
+        _DUPLICATE_SELECTION_CACHE.clear()
         self.df = Mock()
         self.df.schema.json.return_value = '{"fields":[]}'
         self.expectations = {
@@ -109,7 +112,7 @@ class CriticalSelectionTests(unittest.TestCase):
                 self.metadata,
             )
         self.assertEqual(selected, {"not_null_account_id"})
-        self.assertIn("DataBuck: critical auto-discovered rule [MEDIUM] not_null_account_id",
+        self.assertIn("DataBuck: critical rule [MEDIUM] not_null_account_id",
                       output.getvalue())
         self.client.models.generate_content.assert_called_once()
 
@@ -126,7 +129,7 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertIn('"id": 1', prompt)
         self.assertIn('"name": "not_null_account_id"', prompt)
 
-    def test_selection_prompt_contains_only_auto_discovered_rules(self):
+    def test_selection_prompt_accepts_both_rule_sources(self):
         self.client.models.generate_content.return_value.text = '[{"id":1,"priority":"HIGH"}]'
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
@@ -136,8 +139,50 @@ class CriticalSelectionTests(unittest.TestCase):
             )
         self.assertEqual(selected, {"not_null_account_id"})
         prompt = self.client.models.generate_content.call_args.kwargs["contents"]
-        self.assertIn("Review only the DataBuck auto-discovered candidates", prompt)
-        self.assertNotIn("BuckGPT", prompt)
+        self.assertIn("auto-discovered and audited BuckGPT candidates", prompt)
+
+    def test_duplicate_review_compares_auto_and_buckgpt_rules(self):
+        expectations = {
+            "not_null_account_id": "`account_id` IS NOT NULL",
+            "BuckGPT_Rule_001": "NOT COALESCE((account_id IS NULL), FALSE)",
+        }
+        metadata = self.metadata + [{
+            "expectation_name": "BuckGPT_Rule_001",
+            "source_document": "policy.pdf",
+            "reference_context": "Account ID is required.",
+            "check_type": "row",
+        }]
+        self.client.models.generate_content.return_value.text = (
+            '[{"remove_id": 1, "keep_id": 2, "reason": "Same required-ID check"}]'
+        )
+        with patch.dict(sys.modules, self.modules):
+            removed = _identify_duplicate_expectations(
+                expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                metadata, {"not_null_account_id"},
+            )
+        self.assertEqual(removed, {"BuckGPT_Rule_001"})
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn('"source": "AutoDiscovery"', prompt)
+        self.assertIn('"source": "BuckGPT"', prompt)
+        self.assertIn("policy.pdf", prompt)
+        self.assertNotIn("test-key", prompt)
+        self.df.limit.assert_not_called()
+
+    def test_duplicate_review_rejects_removed_representative(self):
+        with self.assertRaisesRegex(ValueError, "representative cannot also be removed"):
+            _parse_duplicate_selection(
+                '[{"remove_id": 1, "keep_id": 2, "reason": "same"}, '
+                '{"remove_id": 2, "keep_id": 3, "reason": "same"}]',
+                ["one", "two", "three"],
+            )
+
+    def test_duplicate_review_keeps_dataset_checks_separate(self):
+        with self.assertRaisesRegex(ValueError, "dataset and row checks"):
+            _parse_duplicate_selection(
+                '[{"remove_id": 1, "keep_id": 2, "reason": "same key"}]',
+                ["dataset_check", "row_check"], {"dataset_check"},
+            )
 
     def test_identical_candidates_reuse_selection_even_when_order_changes(self):
         self.client.models.generate_content.return_value.text = '[{"id":1,"priority":"HIGH"}]'
@@ -152,7 +197,7 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertEqual(first, {"not_null_account_id"})
         self.assertEqual(second, first)
         self.client.models.generate_content.assert_called_once()
-        self.assertIn("reusing critical auto-discovered rule selection", output.getvalue())
+        self.assertIn("reusing critical rule selection", output.getvalue())
 
     def test_changed_business_context_requests_fresh_selection(self):
         self.client.models.generate_content.side_effect = [

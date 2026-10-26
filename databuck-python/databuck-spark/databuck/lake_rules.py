@@ -27,6 +27,7 @@ _PROFILE_METADATA_PARAMETERS = {
     "Value Anomaly Check": ("columns",),
 }
 _CRITICAL_SELECTION_CACHE = {}
+_DUPLICATE_SELECTION_CACHE = {}
 
 
 class DiscoveredRules(list):
@@ -220,22 +221,44 @@ class DiscoveredRules(list):
                 expectations[name] = rule["sql"]
             else:
                 expectations[name] = _context_rule_expectation(rule, name)
-        auto_candidates = {name: expression for name, expression in expectations.items()
-                           if name in auto_expectation_names}
-        if isinstance(context, dict) and "domain_name" in context and auto_candidates:
+        if isinstance(context, dict) and "domain_name" in context and expectations:
             if df is None:
                 raise ValueError("A DataFrame is required to select critical rules")
-            print("DataBuck: selecting critical auto-discovered rules "
-                  "(from {} discovered rules)".format(len(self)), flush=True)
+            metadata = _profile_rule_metadata(self, expectations)
+            buckgpt_metadata = {}
+            for index, rule in enumerate(context_rules or (), start=1):
+                name = "BuckGPT_Rule_{:03d}".format(index)
+                buckgpt_metadata[name] = {
+                    "source_document": rule.get("source_document"),
+                    "reference_context": rule.get("reference_context"),
+                    "description": rule.get("description"),
+                    "check_type": rule.get("check_type") or "row",
+                    "columns": rule.get("columns"),
+                }
+                metadata.append({"expectation_name": name, **buckgpt_metadata[name]})
+            if len(expectations) > 1:
+                print("DataBuck: reviewing duplicate rules ({} auto-discovered, "
+                      "{} BuckGPT)".format(auto_expectation_count,
+                                             len(context_rules or ())), flush=True)
+                removed = _identify_duplicate_expectations(
+                    expectations, df, context, metadata, auto_expectation_names,
+                )
+                expectations = {name: expression for name, expression in expectations.items()
+                                if name not in removed}
+                print("DataBuck: removed {} duplicate rules; {} remain".format(
+                    len(removed), len(expectations)), flush=True)
+            print("DataBuck: selecting critical rules ({} auto-discovered, "
+                  "{} BuckGPT candidates)".format(
+                      len(auto_expectation_names.intersection(expectations)),
+                      len(set(expectations) - auto_expectation_names)), flush=True)
             selected = _select_critical_expectations(
-                auto_candidates, df, context, _profile_rule_metadata(self, auto_candidates),
+                expectations, df, context, metadata,
             )
             expectations = {name: expression for name, expression in expectations.items()
-                            if name not in auto_expectation_names or name in selected}
-            print("DataBuck: selected {} critical auto-discovered rules; "
-                  "retaining {} audited BuckGPT rules".format(
+                            if name in selected}
+            print("DataBuck: selected {} auto-discovered and {} BuckGPT critical rules".format(
                       len(auto_expectation_names.intersection(expectations)),
-                      len(context_rules or ())), flush=True)
+                      len(set(expectations) - auto_expectation_names)), flush=True)
         elif context_rules:
             print("DataBuck: exporting {} auto-discovered and {} BuckGPT rules "
                   "({} total)".format(auto_expectation_count, len(context_rules),
@@ -338,6 +361,127 @@ def _profile_rule_metadata(rules, expectations):
     return metadata
 
 
+def _parse_duplicate_selection(response_text, candidate_names, dataset_names=()):
+    try:
+        result = json.loads(response_text.strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError("response is not valid JSON") from exc
+    if not isinstance(result, list):
+        raise ValueError("response must be a list of duplicate pairs")
+    removed = set()
+    kept = set()
+    for item in result:
+        if not isinstance(item, dict):
+            raise ValueError("each duplicate needs remove_id, keep_id, and reason")
+        remove_id, keep_id, reason = (item.get("remove_id"), item.get("keep_id"),
+                                      item.get("reason"))
+        if (type(remove_id) is not int or type(keep_id) is not int
+                or not 1 <= remove_id <= len(candidate_names)
+                or not 1 <= keep_id <= len(candidate_names)
+                or remove_id == keep_id):
+            raise ValueError("duplicate pair contains invalid candidate IDs")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("duplicate pair needs a reason")
+        if ((candidate_names[remove_id - 1] in dataset_names)
+                != (candidate_names[keep_id - 1] in dataset_names)):
+            raise ValueError("dataset and row checks cannot be duplicates")
+        if remove_id in removed:
+            raise ValueError("duplicate candidate was removed more than once")
+        removed.add(remove_id)
+        kept.add(keep_id)
+    if removed & kept:
+        raise ValueError("a duplicate representative cannot also be removed")
+    return {candidate_names[rule_id - 1] for rule_id in removed}
+
+
+def _identify_duplicate_expectations(expectations, df, context, metadata,
+                                     auto_expectation_names):
+    api_key = str(context.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError("Set context['gemini_api_key'] or GEMINI_API_KEY to review duplicate rules")
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise ImportError("Duplicate rule review requires google-genai") from exc
+
+    metadata_by_name = {item["expectation_name"]: item for item in metadata
+                        if item.get("expectation_name") in expectations}
+    dataset_names = {name for name, item in metadata_by_name.items()
+                     if item.get("check_type") == "uniqueness"}
+    candidate_names = sorted(expectations)
+    candidates = [{
+        "id": index,
+        "name": name,
+        "source": "AutoDiscovery" if name in auto_expectation_names else "BuckGPT",
+        "check": expectations[name],
+        "metadata": metadata_by_name.get(name),
+    } for index, name in enumerate(candidate_names, start=1)]
+    prompt = """Review these exportable DataBuck auto-discovered and audited BuckGPT
+rules for duplicate controls. A duplicate pair checks the same failure on the
+same columns with equivalent conditions, even if names or SQL syntax differ.
+The check field for row rules is a passing condition; dataset uniqueness rules
+are duplicate-group queries. Compare their meaning, scope, null behavior,
+thresholds, and conditional applicability. Pattern and length checks on the
+same column are not automatically duplicates. Keep both if either catches a
+distinct failure. Never merge a dataset uniqueness check with a row check.
+For each true duplicate, keep the clearer, better supported, or more precise
+control; use source metadata and document evidence when available. Do not
+remove a rule merely because it is low priority or shares a column with
+another rule. Criticality will be evaluated separately.
+
+Return only a JSON array of objects with integer remove_id, integer keep_id,
+and a short reason explaining the equivalent check. Example:
+[{{"remove_id": 2, "keep_id": 1, "reason": "Same null check on the same column"}}]
+Use only the candidate IDs below. Every keep_id must remain in the set; do
+not remove a representative or the same candidate twice. Return [] if there
+are no true duplicates. Do not create new rules.
+
+Business domain: {domain}
+DataFrame schema: {schema}
+Candidates (no sample records): {candidates}
+""".format(
+        domain=context["domain_name"],
+        schema=df.schema.json(),
+        candidates=json.dumps(candidates, default=str, ensure_ascii=False,
+                              sort_keys=True),
+    )
+    model = context.get("gemini_model", "gemini-2.5-flash")
+    cache_key = hashlib.sha256(
+        "{}\0{}\0{}".format(api_key, model, prompt).encode("utf-8")
+    ).hexdigest()
+    if cache_key in _DUPLICATE_SELECTION_CACHE:
+        print("DataBuck: reusing duplicate rule review for unchanged inputs", flush=True)
+        return set(_DUPLICATE_SELECTION_CACHE[cache_key])
+
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(
+        temperature=0.0, response_mime_type="application/json",
+    )
+    retry_reason = None
+    for attempt in range(2):
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt if attempt == 0 else (
+                prompt + "\nYour previous response was invalid: {}. Return only "
+                "valid candidate IDs and a reason for each duplicate pair."
+            ).format(retry_reason),
+            config=config,
+        )
+        try:
+            removed = _parse_duplicate_selection(response.text or "", candidate_names,
+                                                 dataset_names)
+            if len(_DUPLICATE_SELECTION_CACHE) >= 32:
+                del _DUPLICATE_SELECTION_CACHE[next(iter(_DUPLICATE_SELECTION_CACHE))]
+            _DUPLICATE_SELECTION_CACHE[cache_key] = frozenset(removed)
+            return removed
+        except ValueError as exc:
+            retry_reason = str(exc)
+    print("DataBuck: duplicate review returned an invalid selection after one retry; "
+          "keeping all rules ({})".format(retry_reason), flush=True)
+    return set()
+
+
 def _select_critical_expectations(expectations, df, context, profile_metadata):
     domain_name = context.get("domain_name")
     if not isinstance(domain_name, str) or not domain_name.strip():
@@ -365,7 +509,8 @@ def _select_critical_expectations(expectations, df, context, profile_metadata):
     prompt = """Act as an independent review committee: a {domain_name} subject matter expert,
 a {domain_name} data engineer, and a data quality governance lead.
 Judge business value independently of the rule's origin.
-Review only the DataBuck auto-discovered candidates below. Select only
+Review the deduplicated DataBuck auto-discovered and audited BuckGPT candidates
+below. Select only
 the rules whose failure would materially affect business decisions, regulatory
 or policy compliance, financial correctness, customer outcomes, or the ability
 to use this dataset for its stated business purpose.
@@ -415,7 +560,7 @@ business priority. Do not assume a {domain_name} subdomain that the context does
 not establish. Evidence from schema or sample patterns alone is inference,
 not a verified business requirement.
 
-Review each distinct auto-discovered SQL check. Retain it only when you can
+Review each distinct SQL check. Retain it only when you can
 identify a concrete business consequence if that exact check fails, supported
 by the supplied business context, schema, and candidate metadata. A profiling
 pattern or length learned from observed data is not automatically a business
@@ -448,7 +593,7 @@ Business context:
 DataFrame schema:
 {schema}
 
-Auto-discovered candidates (no sample records):
+Auto-discovered and BuckGPT candidates (no sample records):
 {candidates}
 """.format(
         domain_name=domain_name.strip(),
@@ -464,10 +609,10 @@ Auto-discovered candidates (no sample records):
     ).hexdigest()
     cached_priorities = _CRITICAL_SELECTION_CACHE.get(cache_key)
     if cached_priorities is not None:
-        print("DataBuck: reusing critical auto-discovered rule selection for unchanged inputs",
+        print("DataBuck: reusing critical rule selection for unchanged inputs",
               flush=True)
         for name, priority in cached_priorities.items():
-            print("DataBuck: critical auto-discovered rule [{}] {}".format(priority, name),
+            print("DataBuck: critical rule [{}] {}".format(priority, name),
                   flush=True)
         return set(cached_priorities)
 
@@ -493,7 +638,7 @@ Auto-discovered candidates (no sample records):
                 del _CRITICAL_SELECTION_CACHE[next(iter(_CRITICAL_SELECTION_CACHE))]
             _CRITICAL_SELECTION_CACHE[cache_key] = priorities
             for name, priority in priorities.items():
-                print("DataBuck: critical auto-discovered rule [{}] {}".format(priority, name),
+                print("DataBuck: critical rule [{}] {}".format(priority, name),
                       flush=True)
             return set(priorities)
         except ValueError as exc:

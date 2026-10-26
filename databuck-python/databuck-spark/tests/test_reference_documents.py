@@ -99,6 +99,8 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertNotIn('[50]', general)
         self.assertIn("60\nor more distinct rules", general)
         self.assertIn("involving 2 to 4 columns", general)
+        self.assertIn("non-positive checks where positive values are semantically impossible", general)
+        self.assertIn("do not assume all amounts, counts, balances, or adjustments", general)
         self.assertIn("BuckGPT_Intel", general)
         self.assertNotIn("BuckGPT_Intel", policy)
 
