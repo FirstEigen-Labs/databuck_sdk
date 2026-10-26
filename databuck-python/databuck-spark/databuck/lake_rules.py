@@ -362,7 +362,9 @@ def _select_critical_expectations(expectations, df, context, profile_metadata):
          "metadata": metadata_by_name.get(name)}
         for index, (name, expression) in enumerate(sorted(expectations.items()), start=1)
     ]
-    prompt = """Act as a {domain_name} subject matter expert and a database expert.
+    prompt = """Act as an independent review committee: a {domain_name} subject matter expert,
+a banking data engineer, and a data quality governance lead.
+Judge business value independently of the rule's origin.
 Review only the DataBuck auto-discovered candidates below. Select only
 the rules whose failure would materially affect business decisions, regulatory
 or policy compliance, financial correctness, customer outcomes, or the ability
@@ -377,6 +379,37 @@ Likewise, do not assume every pattern, length, date, or outlier rule is
 critical. Use the schema, discovery metadata, rule expression, and business
 context to judge impact. Do not infer a business requirement from a column
 name alone.
+
+Before selecting each rule, assess these points internally:
+- Business materiality: could a violation materially affect balances,
+  reporting, reconciliation, risk decisions, customers, compliance, or a
+  significant operational process? Financial-sounding column names alone
+  do not establish materiality.
+- Business correctness: is the rule mathematically and semantically valid
+  for this dataset's lifecycle? Check legitimate zero or missing values,
+  product variations, reporting periods, precision, and rounding. Do not
+  promote an observed pattern or unsupported threshold into a requirement.
+- Production necessity: would this exact check produce an actionable alert,
+  protect a critical data element or process, and add value beyond an
+  upstream schema constraint or existing control?
+- Incremental detection: does the rule detect a distinct failure mode, or
+  is it redundant with a stronger candidate? Keep separate controls only
+  when removing one would materially reduce coverage.
+- False-positive risk: consider conditional applicability and legitimate
+  exceptions. If an important rule needs a missing condition or unverified
+  business definition, treat it as requiring confirmation rather than as a
+  production-ready control.
+
+Retain a Critical candidate only when it has high business impact, valid
+banking semantics, clear applicability, acceptable false-positive risk, and
+distinct detection value. Retain a High Value candidate when it is supported,
+actionable, distinct, and meaningfully useful despite lower severity or
+narrower applicability. Omit low-value, speculative, redundant, and
+confirmation-dependent candidates from the retained set. A simple check can
+be Critical; a complex check can be Low Value. Detection complexity is not
+business priority. Do not assume a banking subdomain that the context does
+not establish. Evidence from schema or sample patterns alone is inference,
+not a verified business requirement.
 
 Review each distinct auto-discovered SQL check. Retain it only when you can
 identify a concrete business consequence if that exact check fails, supported
@@ -397,7 +430,8 @@ For each selected rule, assign a relative business priority using your
 {domain_name} expertise: HIGH for immediate regulatory, financial, customer,
 or operational impact; MEDIUM for a material but less urgent impact; LOW for
 a still worthwhile business review with lower impact. LOW does not mean a
-routine or unsupported rule should be selected. Use the same business context
+routine or unsupported rule should be selected. LOW is a relative priority
+among retained rules, not the Low Value classification above. Use the same business context
 and rule evidence for both selection and priority.
 Return only a JSON array of objects with integer id and string priority
 (HIGH, MEDIUM, or LOW), for example [{{"id": 2, "priority": "HIGH"}}].

@@ -1,3 +1,4 @@
+import csv
 import json
 import io
 import os
@@ -135,8 +136,14 @@ class CombinedExportTests(unittest.TestCase):
                     DataBuck.discover(object(), str(destination))
             discover_context.assert_not_called()
             self.assertIn("Auto-discovery time: 2.50 seconds", output.getvalue())
-            self.assertIn("Auto-discovered DataBuck rules (1)", output.getvalue())
-            self.assertIn("subscriber_id", output.getvalue())
+            self.assertIn("Auto-discovered DataBuck rules: 1", output.getvalue())
+            csv_path = destination.with_name("expectations_all_rules.csv")
+            self.assertIn(str(csv_path), output.getvalue())
+            with csv_path.open(encoding="utf-8-sig", newline="") as stream:
+                csv_rules = list(csv.DictReader(stream))
+            self.assertEqual(len(csv_rules), 1)
+            self.assertEqual(csv_rules[0]["column_name"], "subscriber_id")
+            self.assertEqual(csv_rules[0]["source"], "AutoDiscovery")
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {
                 "warn": {"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"},
                 "drop": {},
@@ -233,6 +240,13 @@ class CombinedExportTests(unittest.TestCase):
                     object(), str(destination), context={"business_context": "test"}
                 )
             self.assertEqual(result, str(destination))
+            with destination.with_name("expectations_all_rules.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as stream:
+                csv_rules = list(csv.DictReader(stream))
+            self.assertEqual([row["source"] for row in csv_rules],
+                             ["AutoDiscovery", "BuckGPT"])
+            self.assertEqual(csv_rules[1]["sql"], buckgpt_rules[0]["sql"])
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {
                 "warn": {},
                 "drop": {"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"},
@@ -276,6 +290,13 @@ class CombinedExportTests(unittest.TestCase):
             self.assertNotIn("not_null_technical_id", str(exported))
             self.assertIn("not_null_account_id", exported["drop"])
             self.assertIn("BuckGPT_Rule_001", exported["fail"])
+            with destination.with_name("expectations_all_rules.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as stream:
+                csv_rules = list(csv.DictReader(stream))
+            self.assertEqual([row["column_name"] for row in csv_rules[:2]],
+                             ["technical_id", "account_id"])
+            self.assertEqual(csv_rules[2]["source_document"], "banking_policy.pdf")
 
     def test_domain_selection_can_leave_only_buckgpt_rules_in_yaml(self):
         profiling_rules = DiscoveredRules([{
