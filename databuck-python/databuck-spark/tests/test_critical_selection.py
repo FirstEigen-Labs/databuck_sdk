@@ -58,6 +58,8 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertIn("strongest, clearest check", prompt)
         self.assertIn("HIGH, MEDIUM, or LOW", prompt)
         self.assertIn("banking data engineer, and a data quality governance lead", prompt)
+        self.assertIn("When pattern and length checks cover the same column", prompt)
+        self.assertIn("retain both only if each catches a distinct, important", prompt)
         self.assertIn("Business correctness", prompt)
         self.assertIn("Production necessity", prompt)
         self.assertIn("Incremental detection", prompt)
@@ -69,6 +71,20 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertNotIn("test-key", prompt)
         self.assertNotIn("DataFrame sample", prompt)
         self.df.limit.assert_not_called()
+
+    def test_selection_uses_supplied_domain_in_reviewer_roles(self):
+        self.client.models.generate_content.return_value.text = "[]"
+        with patch.dict(sys.modules, self.modules):
+            _select_critical_expectations(
+                self.expectations, self.df,
+                {"domain_name": "healthcare", "gemini_api_key": "test-key"},
+                self.metadata,
+            )
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn("healthcare subject matter expert", prompt)
+        self.assertIn("healthcare data engineer", prompt)
+        self.assertIn("healthcare semantics", prompt)
+        self.assertNotIn("banking", prompt)
 
     def test_selection_rejects_unknown_names(self):
         self.client.models.generate_content.return_value.text = '[{"id":3,"priority":"HIGH"}]'

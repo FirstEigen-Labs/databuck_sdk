@@ -363,7 +363,7 @@ def _select_critical_expectations(expectations, df, context, profile_metadata):
         for index, (name, expression) in enumerate(sorted(expectations.items()), start=1)
     ]
     prompt = """Act as an independent review committee: a {domain_name} subject matter expert,
-a banking data engineer, and a data quality governance lead.
+a {domain_name} data engineer, and a data quality governance lead.
 Judge business value independently of the rule's origin.
 Review only the DataBuck auto-discovered candidates below. Select only
 the rules whose failure would materially affect business decisions, regulatory
@@ -376,9 +376,13 @@ the column is named ID or the rule exists. An account, customer, transaction,
 or other key can still be critical when the context shows that missing values
 would break identity, reconciliation, joins, or a required business process.
 Likewise, do not assume every pattern, length, date, or outlier rule is
-critical. Use the schema, discovery metadata, rule expression, and business
-context to judge impact. Do not infer a business requirement from a column
-name alone.
+critical. Select a pattern or length check only when the expected format or
+length is relevant to the supplied business context and its failure has a
+material consequence. When pattern and length checks cover the same column,
+compare them together: retain both only if each catches a distinct, important
+failure; otherwise retain the stronger check. Use the schema, discovery
+metadata, rule expression, and business context to judge impact. Do not infer
+a business requirement from a column name alone.
 
 Before selecting each rule, assess these points internally:
 - Business materiality: could a violation materially affect balances,
@@ -401,13 +405,13 @@ Before selecting each rule, assess these points internally:
   production-ready control.
 
 Retain a Critical candidate only when it has high business impact, valid
-banking semantics, clear applicability, acceptable false-positive risk, and
+{domain_name} semantics, clear applicability, acceptable false-positive risk, and
 distinct detection value. Retain a High Value candidate when it is supported,
 actionable, distinct, and meaningfully useful despite lower severity or
 narrower applicability. Omit low-value, speculative, redundant, and
 confirmation-dependent candidates from the retained set. A simple check can
 be Critical; a complex check can be Low Value. Detection complexity is not
-business priority. Do not assume a banking subdomain that the context does
+business priority. Do not assume a {domain_name} subdomain that the context does
 not establish. Evidence from schema or sample patterns alone is inference,
 not a verified business requirement.
 
