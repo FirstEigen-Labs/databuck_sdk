@@ -260,9 +260,12 @@ class DiscoveredRules(list):
                 expectations, df, context, metadata,
                 priority_output=critical_priorities,
             )
+            selected_for_export = {name for name in selected
+                                   if critical_priorities.get(name) in {"HIGH", "MEDIUM"}}
             expectations = {name: expression for name, expression in expectations.items()
-                            if name in selected}
-            print("DataBuck: selected {} auto-discovered and {} BuckGPT critical rules".format(
+                            if name in selected_for_export}
+            print("DataBuck: exporting {} auto-discovered and {} BuckGPT "
+                  "HIGH/MEDIUM rules".format(
                       len(auto_expectation_names.intersection(expectations)),
                       len(set(expectations) - auto_expectation_names)), flush=True)
         elif context_rules:
@@ -275,16 +278,17 @@ class DiscoveredRules(list):
         expectations = {name: expression for name, expression in expectations.items()
                         if name not in dataset_checks}
 
-        if not expectations and not dataset_checks:
+        if not expectations and not dataset_checks and critical_priorities is None:
             raise ValueError("No Databricks expectations are available to export")
         if export_format == "yaml":
             self.action_decisions = {}
             output_path = write_expectations(
                 expectations, path_where_needs_to_export, table_name=table_name,
                 dataset_checks=dataset_checks,
+                allow_empty=critical_priorities is not None,
             )
             if critical_priorities is not None:
-                _write_high_priority_csv(
+                _write_selected_priority_csv(
                     output_path, critical_priorities, expectations, dataset_checks,
                     auto_expectation_names, metadata, {},
                 )
@@ -307,19 +311,20 @@ class DiscoveredRules(list):
         self.action_decisions = decisions
         output_path = write_expectations(
             grouped, path_where_needs_to_export, dataset_checks=dataset_checks,
+            allow_empty=critical_priorities is not None,
         )
         if critical_priorities is not None:
-            _write_high_priority_csv(
+            _write_selected_priority_csv(
                 output_path, critical_priorities, expectations, dataset_checks,
                 auto_expectation_names, metadata, decisions,
             )
         return output_path
 
 
-def _write_high_priority_csv(output_path, priorities, expectations, dataset_checks,
-                             auto_expectation_names, metadata, decisions):
+def _write_selected_priority_csv(output_path, priorities, expectations, dataset_checks,
+                                 auto_expectation_names, metadata, decisions):
     csv_path = Path(output_path).with_name(
-        "{}_high_rules.csv".format(Path(output_path).stem)
+        "{}_high_medium_rules.csv".format(Path(output_path).stem)
     )
     metadata_by_name = {item["expectation_name"]: item for item in metadata}
     fieldnames = (
@@ -327,18 +332,18 @@ def _write_high_priority_csv(output_path, priorities, expectations, dataset_chec
         "description", "source_document", "reference_context", "expression",
         "sql", "action", "action_reason",
     )
-    high_names = [name for name in sorted(priorities)
-                  if priorities[name] == "HIGH"
-                  and (name in expectations or name in dataset_checks)]
+    selected_names = [name for name in sorted(priorities)
+                      if priorities[name] in {"HIGH", "MEDIUM"}
+                      and (name in expectations or name in dataset_checks)]
     with csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
-        for name in high_names:
+        for name in selected_names:
             rule_metadata = metadata_by_name.get(name) or {}
             decision = decisions.get(name) or {}
             writer.writerow({
                 "rule_name": name,
-                "priority": "HIGH",
+                "priority": priorities[name],
                 "source": ("AutoDiscovery" if name in auto_expectation_names
                            else "BuckGPT"),
                 "rule_type": (rule_metadata.get("rule_type")
@@ -352,8 +357,8 @@ def _write_high_priority_csv(output_path, priorities, expectations, dataset_chec
                 "action": decision.get("action"),
                 "action_reason": decision.get("reason"),
             })
-    print("DataBuck: saved {} HIGH-priority rules to {}".format(
-        len(high_names), csv_path), flush=True)
+    print("DataBuck: saved {} HIGH/MEDIUM rules to {}".format(
+        len(selected_names), csv_path), flush=True)
 
 
 def _context_rule_expectation(rule, name):
@@ -976,17 +981,18 @@ def _yaml_scalar(value):
 
 
 def write_expectations(expectations, path_where_needs_to_export, *, table_name=None,
-                       dataset_checks=None):
+                       dataset_checks=None, allow_empty=False):
     export_format = _export_format(path_where_needs_to_export)
     output = Path(path_where_needs_to_export)
     dataset_checks = dataset_checks or {}
     if export_format == "yaml":
         if table_name is not None:
             table_name = _validated_table_name(table_name)
-        if not expectations and not dataset_checks:
+        if not allow_empty and not expectations and not dataset_checks:
             raise ValueError("No Databricks expectations are available to export")
     else:
-        if not any(expectations.get(action) for action in _ACTIONS) and not dataset_checks:
+        if (not allow_empty and not any(expectations.get(action) for action in _ACTIONS)
+                and not dataset_checks):
             raise ValueError("No Databricks expectations are available to export")
     if export_format == "json" and output.suffix.lower() != ".json":
         output /= "databuck_expectations.json"
