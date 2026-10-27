@@ -171,6 +171,12 @@ If a rule is based on a document, identify the relevant policy text in
 reference_context.
 Use the business domain to interpret the terminology and prioritize relevant
 controls. The domain name alone is not a policy statement.
+Exclude system-managed metadata dates and timestamps used only to record row
+creation, last update, ingestion, loading, or ETL audit activity. Examples
+include created_at, create_at, updated_at, update_at, ingested_at, load_ts,
+and etl_timestamp. Never generate a BuckGPT rule whose SQL uses such a column,
+even for completeness, freshness, chronology, or a cross-column relationship.
+Business event dates such as loan issue and payment dates remain eligible.
 
 Return a nonempty JSON array when at least one supported rule can be derived.
 Do not return [] merely because some documents are irrelevant. Return [] only
@@ -283,6 +289,12 @@ or relationships. Do not infer a uniqueness contract merely because values in
 Do not create standalone null checks for any column, including amounts, dates,
 terms, and identifiers. DataBuck auto-discovery already handles null checks.
 Do not claim a column is mandatory solely to justify an IS NULL rule.
+Exclude system-managed metadata dates and timestamps used only for row creation,
+last update, ingestion, loading, or ETL audit activity (for example created_at,
+create_at, updated_at, update_at, ingested_at, load_ts, etl_timestamp). Do not
+generate any BuckGPT rule whose SQL uses one of these columns, including
+freshness, chronology, sign, or cross-column checks. Business event dates such
+as loan issue and payment dates remain eligible.
 
 Return a JSON array. Each row-level rule must have these string fields: name,
 description, source_document, reference_context, sql. Set source_document to
@@ -327,6 +339,11 @@ reference documents together. Look for conditional population, chronology,
 arithmetic reconciliation, subset or ordering constraints, and status-dependent
 relationships. Check all relevant columns in each relationship. Do not create
 single-column checks, standalone null checks, or uniqueness checks.
+Exclude system-managed metadata dates and timestamps used only for row creation,
+last update, ingestion, loading, or ETL audit activity (for example created_at,
+create_at, updated_at, update_at, ingested_at, load_ts, etl_timestamp). Never
+use them in cross-column SQL or infer business chronology from them. Business
+event dates such as loan issue and payment dates remain eligible.
 
 First use explicit statements from the attached PDFs, Word document text, or
 Business context. For each document-backed rule, quote one exact supporting
@@ -663,6 +680,11 @@ Pass a rule only when all conditions are true:
   universal non-negativity, uniqueness, or cross-column requirements alone.
   Reject speculative constraints and standalone null checks on any column for
   BuckGPT_Intel, even when the rationale calls that column fundamental.
+- Reject any rule whose SQL uses a system-managed row creation, update,
+  ingestion, load, or ETL audit timestamp (for example created_at, create_at,
+  updated_at, update_at, ingested_at, load_ts, etl_timestamp). These are
+  operational metadata, not business event dates. Business event dates such as
+  loan issue and payment dates remain eligible.
 - A BuckGPT_Intel uniqueness check has check_type "uniqueness", key columns
   from the schema, and a dataset-level SQL query that returns duplicate key
   groups. Pass it only when its key has a convincing business identity

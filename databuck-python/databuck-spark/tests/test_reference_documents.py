@@ -76,6 +76,26 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertIn("Balances must reconcile", prompt)
         self.assertIn("Business domain:\nbanking", _build_audit_prompt(prompt, []))
 
+    def test_buckgpt_prompts_exclude_system_dates_but_allow_business_dates(self):
+        df = Mock()
+        df.schema.fields = [SimpleNamespace(
+            name=name, dataType=SimpleNamespace(simpleString=lambda: "timestamp"),
+            nullable=True,
+        ) for name in ("created_at", "updated_at", "issue_d", "last_pymnt_d")]
+        context = {"domain_name": "banking"}
+        policy = _build_prompt(df, context, [], [], sample_rows=[])
+        general = _build_general_prompt(df, context, [])
+        cross = _build_cross_column_prompt(
+            df, context, [], [], [], {"BuckGPT_Intel"},
+        )
+        audit = _build_audit_prompt(policy + general + cross, [])
+        for prompt in (policy, general, cross, audit):
+            self.assertIn("created_at", prompt)
+            self.assertIn("updated_at", prompt)
+            self.assertIn("ingested_at", prompt)
+            self.assertIn("loan issue and payment dates remain eligible", prompt)
+        self.assertIn("Reject any rule whose SQL uses a system-managed", audit)
+
     def test_policy_uses_ten_rows_and_general_uses_fifty(self):
         df = Mock()
         df.schema.fields = [SimpleNamespace(
