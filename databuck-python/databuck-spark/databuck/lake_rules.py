@@ -553,6 +553,8 @@ def _select_critical_expectations(expectations, df, context, profile_metadata,
     api_key = str(context.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
         raise ValueError("Set context['gemini_api_key'] or GEMINI_API_KEY to select critical rules")
+    column_count = len(df.schema.fields)
+    max_selected = (5 * column_count) // 4
 
     try:
         from google import genai
@@ -578,6 +580,10 @@ below. Select only
 the rules whose failure would materially affect business decisions, regulatory
 or policy compliance, financial correctness, customer outcomes, or the ability
 to use this dataset for its stated business purpose.
+Select at most {max_selected} rules in total across both sources and all
+priorities for this {column_count}-column DataFrame (floor of 1.25 times the
+column count). This is a ceiling, not a target. Return fewer when fewer are
+defensible; choose by evidence and business value, not candidate order.
 
 Evaluate each rule in the supplied business context. A generic completeness
 check on a technical ID is often low value; do not select it merely because
@@ -637,8 +643,8 @@ same outcome, keep the strongest, clearest check and omit weaker or redundant
 ones. Keep distinct legal or business obligations when each has a material
 consequence. Internally identify the consequence for every selected rule;
 exclude any rule whose impact you cannot explain from the supplied context.
-Do not aim for a fixed count or percentage, and do not select all candidates
-by default.
+Do not fill the ceiling merely to reach a count, and do not select all
+candidates by default.
 For each selected rule, assign a relative business priority using your
 {domain_name} expertise: HIGH for immediate regulatory, financial, customer,
 or operational impact; MEDIUM for a material but less urgent impact; LOW for
@@ -661,6 +667,8 @@ Auto-discovered and BuckGPT candidates (no sample records):
 {candidates}
 """.format(
         domain_name=domain_name.strip(),
+        max_selected=max_selected,
+        column_count=column_count,
         context=json.dumps(business_context, default=str, ensure_ascii=False,
                            sort_keys=True),
         schema=df.schema.json(),
@@ -668,6 +676,8 @@ Auto-discovered and BuckGPT candidates (no sample records):
                               sort_keys=True),
     )
     model = context.get("gemini_model", "gemini-2.5-flash")
+    print("DataBuck: critical selection limit {} for {} columns".format(
+        max_selected, column_count), flush=True)
     cache_key = hashlib.sha256(
         "{}\0{}\0{}".format(api_key, model, prompt).encode("utf-8")
     ).hexdigest()
@@ -699,7 +709,9 @@ Auto-discovered and BuckGPT candidates (no sample records):
             config=config,
         )
         try:
-            priorities = _parse_critical_profile_selection(response.text or "", expectations)
+            priorities = _parse_critical_profile_selection(
+                response.text or "", expectations, max_selected=max_selected,
+            )
             if len(_CRITICAL_SELECTION_CACHE) >= 32:
                 del _CRITICAL_SELECTION_CACHE[next(iter(_CRITICAL_SELECTION_CACHE))]
             _CRITICAL_SELECTION_CACHE[cache_key] = priorities
@@ -718,7 +730,7 @@ Auto-discovered and BuckGPT candidates (no sample records):
                 ) from exc
 
 
-def _parse_critical_profile_selection(response_text, expectations):
+def _parse_critical_profile_selection(response_text, expectations, max_selected=None):
     try:
         result = json.loads(response_text.strip())
     except json.JSONDecodeError as exc:
@@ -741,6 +753,9 @@ def _parse_critical_profile_selection(response_text, expectations):
         if name in priorities:
             raise ValueError("duplicate candidate ID: {}".format(rule_id))
         priorities[name] = priority.upper()
+    if max_selected is not None and len(priorities) > max_selected:
+        raise ValueError("selected {} rules; limit is {}".format(
+            len(priorities), max_selected))
     return priorities
 
 

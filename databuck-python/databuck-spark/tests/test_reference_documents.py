@@ -122,7 +122,12 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertIn('[49]]}', general)
         self.assertNotIn('[10]', policy)
         self.assertNotIn('[50]', general)
-        self.assertIn("60\nor more distinct rules", general)
+        for prompt in (policy, general, cross_column):
+            normalized = " ".join(prompt.split())
+            self.assertIn("maximum selected-rule count of 1", normalized)
+            self.assertIn("Java auto-discovery and all BuckGPT phases", normalized)
+            self.assertIn("1-column DataFrame", normalized)
+        self.assertNotIn("60\nor more distinct rules", general)
         self.assertIn("involving 2 to 4 columns", general)
         self.assertIn("non-positive checks where positive values are semantically impossible", general)
         self.assertIn("do not assume all amounts, counts, balances, or adjustments", general)
@@ -351,7 +356,12 @@ class ReferenceDocumentTests(unittest.TestCase):
             }
             audit = [{"rule_index": 1, "audit_status": "PASSED",
                       "audit_reason": "Quote verified in named document."}]
-            df = SimpleNamespace(schema=SimpleNamespace(fields=[]))
+            df = SimpleNamespace(schema=SimpleNamespace(fields=[
+                SimpleNamespace(name=name,
+                                dataType=SimpleNamespace(simpleString=lambda: "double"),
+                                nullable=True)
+                for name in ("funded_amnt_inv", "funded_amnt")
+            ]))
             output = io.StringIO()
             with patch("databuck.agentic_rules._sample_rows", return_value=[]), \
                  patch("databuck.agentic_rules._generate_and_audit_with_gemini",
@@ -364,7 +374,8 @@ class ReferenceDocumentTests(unittest.TestCase):
             self.assertIn("Source document: banking_policy.pdf", output.getvalue())
             self.assertEqual(generate.call_args.kwargs["allowed_sources"],
                              {path.name, "BuckGPT_Intel"})
-            self.assertIn("there is no target count", generate.call_args.kwargs["prompt"])
+            self.assertIn("maximum selected-rule count of 2",
+                          generate.call_args.kwargs["prompt"])
             self.assertNotIn("rule_count", generate.call_args.kwargs)
 
     def test_policy_prompt_excludes_general_source(self):

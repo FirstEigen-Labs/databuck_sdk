@@ -154,11 +154,16 @@ def _build_prompt(
     document_names = [os.path.basename(path) for path in reference_paths]
     allowed_sources = sorted(_allowed_rule_sources(context, reference_paths)
                              - {INTEL_SOURCE})
+    review_limit = (5 * len(schema)) // 4
 
     return """You are a data-quality rule generator.
 Generate accurate data-quality SQL rules for the DataFrame described below.
-Choose the number of rules based on the distinct, well-supported checks you
-find; there is no target count. Omit redundant or weak rules.
+The later critical review has a maximum selected-rule count of {review_limit}
+across exportable Java auto-discovery and all BuckGPT phases for this
+{column_count}-column DataFrame (floor of 1.25 times the column count).
+This is a ceiling on final selection, not a target for this phase. Generate
+only the strongest distinct, well-supported rules. Leave room for the other
+sources and omit redundant or weak rules.
 The attached PDFs and Word document text are approved reference context. Use
 all of them when they support a rule. Generate only rules supported by an
 explicit statement in a supplied document or Business context. Do not infer
@@ -250,6 +255,8 @@ Up to 10 sample records (columns listed once, rows in the same order):
 {sample_rows}
 """.format(
         placeholder=DATAFRAME_PLACEHOLDER,
+        review_limit=review_limit,
+        column_count=len(schema),
         schema=json.dumps(schema, indent=2),
         domain_name=domain_name.strip() if domain_name is not None else "Not provided",
         context=json.dumps(safe_context, default=str, indent=2),
@@ -264,11 +271,15 @@ def _build_general_prompt(df: Any, context: dict,
                           sample_rows: list[dict[str, Any]]) -> str:
     schema = [{"name": field.name, "type": field.dataType.simpleString(),
                "nullable": field.nullable} for field in df.schema.fields]
+    review_limit = (5 * len(schema)) // 4
     return """You are a business data-quality expert. Generate only important,
 defensible general SQL rules for the supplied DataFrame. Review the full
-schema systematically; for a wide schema, seek broad coverage, including 60
-or more distinct rules when that many are genuinely justified. Do not pad the
-list with redundant or speculative checks to reach a number. Use the business
+schema systematically. The later critical review has a maximum selected-rule
+count of {review_limit} across exportable Java auto-discovery and all
+BuckGPT phases for this {column_count}-column DataFrame (floor of 1.25 times
+the column count). This is a ceiling on final selection, not a generation
+target. Generate only the strongest justified general rules, leave room for
+the other sources, and do not pad the list to reach any count. Use the business
 domain, schema, and up to 50 sample records to understand the data, but do not
 mistake a sample pattern for a universal contract. Return [] when a rule could
 reject legitimate records.
@@ -317,6 +328,8 @@ DataFrame schema: {schema}
 Sample records (columns listed once, rows in the same order): {sample_rows}
 """.format(
         placeholder=DATAFRAME_PLACEHOLDER,
+        review_limit=review_limit,
+        column_count=len(schema),
         domain=context.get("domain_name") or "Not provided",
         schema=json.dumps(schema, default=str),
         sample_rows=_compact_sample_rows(df, sample_rows),
@@ -330,6 +343,7 @@ def _build_cross_column_prompt(
 ) -> str:
     schema = [{"name": field.name, "type": field.dataType.simpleString(),
                "nullable": field.nullable} for field in df.schema.fields]
+    review_limit = (5 * len(schema)) // 4
     business_context = {key: value for key, value in context.items()
                         if key not in _CONTROL_CONTEXT_KEYS}
     return """You are a {domain} subject matter expert and data engineer.
@@ -339,6 +353,12 @@ reference documents together. Look for conditional population, chronology,
 arithmetic reconciliation, subset or ordering constraints, and status-dependent
 relationships. Check all relevant columns in each relationship. Do not create
 single-column checks, standalone null checks, or uniqueness checks.
+The later critical review has a maximum selected-rule count of {review_limit}
+across exportable Java auto-discovery and all BuckGPT phases for this
+{column_count}-column DataFrame (floor of 1.25 times the column count).
+This is a ceiling on final selection, not a generation target. Generate only
+the strongest additional relationships, leave room for the other sources,
+and do not fill a quota.
 Exclude system-managed metadata dates and timestamps used only for row creation,
 last update, ingestion, loading, or ETL audit activity (for example created_at,
 create_at, updated_at, update_at, ingested_at, load_ts, etl_timestamp). Never
@@ -377,6 +397,8 @@ Word document text: {word_documents}
 Up to 50 sample records (columns listed once, rows in the same order): {sample_rows}
 """.format(
         domain=context.get("domain_name") or "Not provided",
+        review_limit=review_limit,
+        column_count=len(schema),
         schema=json.dumps(schema, default=str),
         context=json.dumps(business_context, default=str, ensure_ascii=False),
         documents=json.dumps([os.path.basename(path) for path in reference_paths]),

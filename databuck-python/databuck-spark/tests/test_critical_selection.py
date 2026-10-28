@@ -23,6 +23,7 @@ class CriticalSelectionTests(unittest.TestCase):
         _CRITICAL_SELECTION_CACHE.clear()
         _DUPLICATE_SELECTION_CACHE.clear()
         self.df = Mock()
+        self.df.schema.fields = [Mock(), Mock()]
         self.df.schema.json.return_value = '{"fields":[]}'
         self.expectations = {
             "not_null_technical_id": "`technical_id` IS NOT NULL",
@@ -357,22 +358,63 @@ class CriticalSelectionTests(unittest.TestCase):
             )
         self.assertEqual(selected, set())
 
-    def test_selection_has_no_fixed_count_limit(self):
+    def test_selection_limit_is_125_percent_of_combined_schema_columns(self):
+        self.df.schema.fields = [Mock() for _ in range(79)]
         expectations = {"not_null_field_{}".format(index): "`field_{}` IS NOT NULL".format(index)
                         for index in range(107)}
         self.client.models.generate_content.return_value.text = json.dumps([
-            {"id": index, "priority": "LOW"} for index in range(1, 108)
+            {"id": index, "priority": "HIGH"} for index in range(1, 99)
         ])
         with patch.dict(sys.modules, self.modules):
             selected = _select_critical_expectations(
                 expectations, self.df,
                 {"domain_name": "banking", "gemini_api_key": "test-key"}, [],
             )
-        self.assertEqual(selected, set(expectations))
+        self.assertEqual(len(selected), 98)
         self.client.models.generate_content.assert_called_once()
         prompt = self.client.models.generate_content.call_args.kwargs["contents"]
-        self.assertIn("Do not aim for a fixed count or percentage", prompt)
-        self.assertNotIn("BuckGPT_Rule_", prompt)
+        self.assertIn("Select at most 98 rules", prompt)
+        self.assertIn("79-column DataFrame", prompt)
+        self.assertIn("auto-discovered and audited BuckGPT", prompt)
+
+    def test_selection_retries_when_combined_limit_is_exceeded(self):
+        self.df.schema.fields = [Mock() for _ in range(4)]  # floor(1.25 * 4) = 5
+        expectations = {"BuckGPT_Rule_001": "funded_amnt_inv <= funded_amnt"}
+        expectations.update({"rule_{}".format(index): "field_{} > 0".format(index)
+                             for index in range(5)})
+        self.client.models.generate_content.side_effect = [
+            SimpleNamespace(text=json.dumps([
+                {"id": index, "priority": "HIGH"} for index in range(1, 7)
+            ])),
+            SimpleNamespace(text=json.dumps([
+                {"id": index, "priority": "HIGH"} for index in range(1, 6)
+            ])),
+        ]
+        with patch.dict(sys.modules, self.modules):
+            selected = _select_critical_expectations(
+                expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"}, [],
+            )
+        self.assertEqual(len(selected), 5)
+        self.assertIn("BuckGPT_Rule_001", selected)
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+        retry_prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn("selected 6 rules; limit is 5", retry_prompt)
+
+    def test_selection_does_not_trim_an_over_limit_retry(self):
+        self.df.schema.fields = [Mock() for _ in range(4)]
+        expectations = {"rule_{}".format(index): "field_{} > 0".format(index)
+                        for index in range(6)}
+        self.client.models.generate_content.return_value.text = json.dumps([
+            {"id": index, "priority": "HIGH"} for index in range(1, 7)
+        ])
+        with patch.dict(sys.modules, self.modules):
+            with self.assertRaisesRegex(ValueError, "selected 6 rules; limit is 5"):
+                _select_critical_expectations(
+                    expectations, self.df,
+                    {"domain_name": "banking", "gemini_api_key": "test-key"}, [],
+                )
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
 
     def test_profile_metadata_excludes_sample_values(self):
         metadata = _profile_rule_metadata([
