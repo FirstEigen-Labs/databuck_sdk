@@ -1,8 +1,8 @@
 import os
 
-from .sdk import DataBuck
+from .sdk import DataBuck, _jar_setting
 
-if os.environ.get("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "1").lower() not in ("0", "false", "no"):
-    os.environ["DATABUCK_SPARK_SDK_JAR"] = DataBuck.download_jar()
+if _jar_setting("AUTO_DOWNLOAD", "1").lower() not in ("0", "false", "no"):
+    os.environ["DATABUCK_SDK_JAR"] = DataBuck.download_jar()
 
 __all__ = ["DataBuck"]

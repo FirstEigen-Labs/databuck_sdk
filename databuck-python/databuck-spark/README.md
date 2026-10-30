@@ -20,26 +20,26 @@ python -m pip uninstall databuck-spark-sdk
 python -m pip install --upgrade databuck-sdk
 ```
 
-Importing `databuck` downloads `databuck-spark-sdk.jar` from the DataBuck S3
+Importing `databuck` downloads `databuck-sdk.jar` from the DataBuck S3
 URL to `databuck/jars/` in the installed Python package, with progress output.
-The downloaded path is set in `DATABUCK_SPARK_SDK_JAR` for the current Python
+The downloaded path is set in `DATABUCK_SDK_JAR` for the current Python
 process. A later import reuses the existing JAR.
 The JAR is not included in the wheel because it exceeds PyPI's
 default per-file upload limit. An internet connection and write access to the
 installed package directory are required for the first download.
 
 `python -m databuck` is an explicit download command that also prints the
-local path. Set `DATABUCK_SPARK_SDK_AUTO_DOWNLOAD=0` before import to defer the
+local path. Set `DATABUCK_SDK_AUTO_DOWNLOAD=0` before import to defer the
 download when offline. `DataBuck.jar_path()` returns the path after download.
 Downloading the JAR does not install it as a Databricks compute library.
 
 To use an existing JAR or another writable destination, set
-`DATABUCK_SPARK_SDK_JAR` to that file path. If the download URL changes, set
-`DATABUCK_SPARK_SDK_JAR_URL` to the new HTTPS URL before importing or running
+`DATABUCK_SDK_JAR` to that file path. If the download URL changes, set
+`DATABUCK_SDK_JAR_URL` to the new HTTPS URL before importing or running
 `python -m databuck`. The download is checked against
 the published JAR's SHA-256 hash. If the JAR content changes, publish a new
 Python package version with its new hash, or set
-`DATABUCK_SPARK_SDK_JAR_SHA256` to the expected hash.
+`DATABUCK_SDK_JAR_SHA256` to the expected hash.
 
 ### Databricks notebook setup
 
@@ -65,8 +65,8 @@ from importlib.metadata import version
 
 print(version("databuck-sdk"))
 
-os.environ["DATABUCK_SPARK_SDK_JAR"] = (
-    "/Volumes/catalog/schema/volume/databuck-spark-sdk.jar"
+os.environ["DATABUCK_SDK_JAR"] = (
+    "/Volumes/catalog/schema/volume/databuck-sdk.jar"
 )
 
 from databuck import DataBuck  # Downloads the JAR to that path on first import.
@@ -85,6 +85,8 @@ compute > **Libraries** > **Install New**, select the Volume as the library
 source, choose the JAR path printed above, and install it. If the compute is
 already running, restart it or reattach the notebook so Spark loads the new
 library. Then read your Spark DataFrame and run the discovery example below.
+If the old `databuck-spark-sdk.jar` is attached to that compute, remove it
+before attaching `databuck-sdk.jar`.
 The Python import downloads the file; it does not attach the JAR to compute.
 See [Databricks compute-scoped library instructions](https://docs.databricks.com/aws/en/libraries/cluster-libraries).
 
@@ -112,7 +114,8 @@ print(DataBuck.count(df))
 Run discovery in a Databricks notebook or Spark job against an existing DataFrame,
 or pass a Spark table name and the SDK will read it into a DataFrame internally.
 Pass PDF and DOCX policy files for context-aware BuckGPT rules.
-The SDK exports generated rules as JSON (`.json`) or YAML (`.yaml` / `.yml`).
+The SDK exports generated rules as JSON (`.json`), YAML (`.yaml` / `.yml`),
+or a Great Expectations suite (`.gx.json`).
 A Lakeflow Declarative Pipeline then loads and executes those rules as
 expectations. Choose one of the two JSON inputs below; both use the same
 discovery and export flow. The YAML workflow appears below.
@@ -333,3 +336,26 @@ argument to `DataBuck.discover(...)` to combine discovery and export.
 
 In JSON, each action dictionary maps expectation names to Spark SQL pass
 conditions, such as `{"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"}`.
+
+## Export a Great Expectations suite
+
+Install the GX extra, then give `DataBuck.discover` a path ending in `.gx.json`:
+
+```python
+%pip install "databuck-sdk[gx]"
+```
+
+```python
+gx_path = DataBuck.discover(
+    "catalog.schema.loan_table",
+    "/Volumes/catalog/schema/volume/loan_expectations.gx.json",
+    context=context,
+)
+print(gx_path)
+```
+
+The GX file contains the selected HIGH and MEDIUM rules when `domain_name` is
+provided. With no domain, it contains all exportable rules. It includes
+dataset-level checks. Each row rule keeps its DataBuck action (`warn`, `drop`,
+or `fail`) in GX metadata. GX validation reports failures; it does not apply
+Lakeflow drop or fail actions to the data.

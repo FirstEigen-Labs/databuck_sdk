@@ -10,7 +10,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
+os.environ.setdefault("DATABUCK_SDK_AUTO_DOWNLOAD", "0")
 
 from databuck.agentic_rules import (
     _build_audit_prompt,

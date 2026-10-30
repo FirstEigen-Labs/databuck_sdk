@@ -10,9 +10,9 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", "0")
+os.environ.setdefault("DATABUCK_SDK_AUTO_DOWNLOAD", "0")
 
-from databuck.sdk import DataBuck, JAR_URL
+from databuck.sdk import DataBuck, JAR_NAME, JAR_URL
 
 
 def jar_bytes():
@@ -26,13 +26,31 @@ class JarDownloadTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.jar = Path(self.temp.name) / "jars" / "databuck-spark-sdk.jar"
+        self.jar = Path(self.temp.name) / "jars" / "databuck-sdk.jar"
+
+    def test_default_download_name_uses_new_sdk_name(self):
+        self.assertEqual(JAR_NAME, "databuck-sdk.jar")
+        self.assertEqual(
+            JAR_URL,
+            "https://tmplog1-pub.s3.us-east-1.amazonaws.com/databuck-sdk.jar",
+        )
+
+    def test_legacy_jar_environment_variable_remains_supported(self):
+        payload = jar_bytes()
+        with patch.dict(os.environ, {
+            "DATABUCK_SPARK_SDK_JAR": str(self.jar),
+            "DATABUCK_SPARK_SDK_JAR_SHA256": hashlib.sha256(payload).hexdigest(),
+        }, clear=True):
+            with patch("databuck.sdk.urllib.request.urlopen",
+                       return_value=io.BytesIO(payload)):
+                self.assertEqual(DataBuck.download_jar(), str(self.jar.resolve()))
+                self.assertEqual(DataBuck.jar_path(), str(self.jar.resolve()))
 
     def test_explicit_download_to_configured_path_once(self):
         payload = jar_bytes()
         environment = {
-            "DATABUCK_SPARK_SDK_JAR": str(self.jar),
-            "DATABUCK_SPARK_SDK_JAR_SHA256": hashlib.sha256(payload).hexdigest(),
+            "DATABUCK_SDK_JAR": str(self.jar),
+            "DATABUCK_SDK_JAR_SHA256": hashlib.sha256(payload).hexdigest(),
         }
         with patch.dict(os.environ, environment, clear=False):
             with patch("databuck.sdk.urllib.request.urlopen", return_value=io.BytesIO(payload)) as open_url:
@@ -47,10 +65,10 @@ class JarDownloadTests(unittest.TestCase):
         source = Path(self.temp.name) / "source.jar"
         source.write_bytes(payload)
         environment = os.environ.copy()
-        environment.pop("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", None)
-        environment["DATABUCK_SPARK_SDK_JAR"] = str(self.jar)
-        environment["DATABUCK_SPARK_SDK_JAR_URL"] = source.as_uri()
-        environment["DATABUCK_SPARK_SDK_JAR_SHA256"] = hashlib.sha256(payload).hexdigest()
+        environment.pop("DATABUCK_SDK_AUTO_DOWNLOAD", None)
+        environment["DATABUCK_SDK_JAR"] = str(self.jar)
+        environment["DATABUCK_SDK_JAR_URL"] = source.as_uri()
+        environment["DATABUCK_SDK_JAR_SHA256"] = hashlib.sha256(payload).hexdigest()
         result = subprocess.run(
             [sys.executable, "-m", "databuck"],
             cwd=Path(__file__).resolve().parents[1],
@@ -67,12 +85,12 @@ class JarDownloadTests(unittest.TestCase):
         source = Path(self.temp.name) / "source.jar"
         source.write_bytes(payload)
         environment = os.environ.copy()
-        environment.pop("DATABUCK_SPARK_SDK_AUTO_DOWNLOAD", None)
-        environment["DATABUCK_SPARK_SDK_JAR"] = str(self.jar)
-        environment["DATABUCK_SPARK_SDK_JAR_URL"] = source.as_uri()
-        environment["DATABUCK_SPARK_SDK_JAR_SHA256"] = hashlib.sha256(payload).hexdigest()
+        environment.pop("DATABUCK_SDK_AUTO_DOWNLOAD", None)
+        environment["DATABUCK_SDK_JAR"] = str(self.jar)
+        environment["DATABUCK_SDK_JAR_URL"] = source.as_uri()
+        environment["DATABUCK_SDK_JAR_SHA256"] = hashlib.sha256(payload).hexdigest()
         result = subprocess.run(
-            [sys.executable, "-c", "import databuck, os; print(os.environ['DATABUCK_SPARK_SDK_JAR'])"],
+            [sys.executable, "-c", "import databuck, os; print(os.environ['DATABUCK_SDK_JAR'])"],
             cwd=Path(__file__).resolve().parents[1],
             env=environment,
             capture_output=True,
@@ -84,7 +102,7 @@ class JarDownloadTests(unittest.TestCase):
         self.assertEqual(self.jar.read_bytes(), payload)
 
     def test_jar_path_requires_download(self):
-        with patch.dict(os.environ, {"DATABUCK_SPARK_SDK_JAR": str(self.jar)}, clear=False):
+        with patch.dict(os.environ, {"DATABUCK_SDK_JAR": str(self.jar)}, clear=False):
             with self.assertRaisesRegex(FileNotFoundError, "python -m databuck"):
                 DataBuck.jar_path()
 

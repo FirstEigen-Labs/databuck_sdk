@@ -11,23 +11,29 @@ import zipfile
 from pathlib import Path
 
 
-JAR_URL = "https://tmplog1-pub.s3.us-east-1.amazonaws.com/databuck-spark-sdk.jar"
-JAR_NAME = "databuck-spark-sdk.jar"
+JAR_URL = "https://tmplog1-pub.s3.us-east-1.amazonaws.com/databuck-sdk.jar"
+JAR_NAME = "databuck-sdk.jar"
 JAR_SHA256 = "c85e35442f9416bdfbe69d66e3e786affa3b1861d526a1cf363bb25a34f470e6"
+
+
+def _jar_setting(name, default=None):
+    return (os.environ.get("DATABUCK_SDK_" + name)
+            or os.environ.get("DATABUCK_SPARK_SDK_" + name)
+            or default)
 
 
 class DataBuck:
 
     @staticmethod
     def jar_path() -> str:
-        configured = os.environ.get("DATABUCK_SPARK_SDK_JAR")
+        configured = _jar_setting("JAR")
         jar = (Path(configured).expanduser() if configured else
                Path(__file__).resolve().parent / "jars" / JAR_NAME)
         if not jar.is_file():
             raise FileNotFoundError(
-                f"DataBuck Spark SDK JAR was not found at {jar}. "
+                f"DataBuck SDK JAR was not found at {jar}. "
                 "Run `python -m databuck` to download it, or set "
-                "DATABUCK_SPARK_SDK_JAR to an existing local JAR path."
+                "DATABUCK_SDK_JAR to an existing local JAR path."
             )
         return str(jar.resolve())
 
@@ -35,15 +41,15 @@ class DataBuck:
     def download_jar(destination=None) -> str:
         """Download the Spark JAR to the package path or a configured path."""
         if destination is None:
-            configured = os.environ.get("DATABUCK_SPARK_SDK_JAR")
+            configured = _jar_setting("JAR")
             destination = (Path(configured).expanduser() if configured else
                            Path(__file__).resolve().parent / "jars" / JAR_NAME)
         jar = Path(destination).expanduser()
         if jar.is_file():
             return str(jar.resolve())
 
-        url = os.environ.get("DATABUCK_SPARK_SDK_JAR_URL", JAR_URL)
-        expected_sha256 = os.environ.get("DATABUCK_SPARK_SDK_JAR_SHA256", JAR_SHA256)
+        url = _jar_setting("JAR_URL", JAR_URL)
+        expected_sha256 = _jar_setting("JAR_SHA256", JAR_SHA256)
         temporary = None
         try:
             jar.parent.mkdir(parents=True, exist_ok=True)
@@ -80,10 +86,10 @@ class DataBuck:
             print(f"databuck: JAR ready at {jar}", file=sys.stderr)
         except (OSError, ValueError, urllib.error.URLError) as exc:
             raise RuntimeError(
-                f"Could not download the DataBuck Spark SDK JAR from {url} "
-                f"to {jar}: {exc}. Set DATABUCK_SPARK_SDK_JAR to an existing "
-                "local JAR path or DATABUCK_SPARK_SDK_JAR_URL to a reachable URL. "
-                "If the JAR changes, also set DATABUCK_SPARK_SDK_JAR_SHA256."
+                f"Could not download the DataBuck SDK JAR from {url} "
+                f"to {jar}: {exc}. Set DATABUCK_SDK_JAR to an existing "
+                "local JAR path or DATABUCK_SDK_JAR_URL to a reachable URL. "
+                "If the JAR changes, also set DATABUCK_SDK_JAR_SHA256."
             ) from exc
         finally:
             if temporary is not None:
@@ -1309,7 +1315,7 @@ class DataBuck:
     @staticmethod
     def discover(df, path=None, *, context: dict | None = None,
                  table_name: str | None = None):
-        """Discover rules from a DataFrame or Spark table and export JSON/YAML.
+        """Discover rules from a DataFrame or Spark table and export JSON/YAML/GX.
 
         A file path selects combined profiling and BuckGPT export. Passing a
         context dictionary as the second argument retains the older API that

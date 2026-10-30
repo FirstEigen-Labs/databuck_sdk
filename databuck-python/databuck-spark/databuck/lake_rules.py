@@ -95,7 +95,7 @@ class DiscoveredRules(list):
 
     def to_lake(self, path_where_needs_to_export, *, df=None, context=None,
                 context_rules=None, table_name=None):
-        """Export expectations as action-grouped JSON or table-scoped YAML.
+        """Export expectations as JSON, YAML, or a GX suite.
 
         JSON groups rules by action. Pass ``df`` and ``context`` to have Gemini
         select those actions; without context, every JSON rule uses ``warn``.
@@ -309,10 +309,18 @@ class DiscoveredRules(list):
         for name, expression in expectations.items():
             grouped[decisions[name]["action"]][name] = expression
         self.action_decisions = decisions
-        output_path = write_expectations(
-            grouped, path_where_needs_to_export, dataset_checks=dataset_checks,
-            allow_empty=critical_priorities is not None,
-        )
+        if export_format == "gx":
+            from .gx_rules import write_gx_suite
+
+            output_path = write_gx_suite(
+                grouped, path_where_needs_to_export, df=df,
+                dataset_checks=dataset_checks, table_name=table_name,
+            )
+        else:
+            output_path = write_expectations(
+                grouped, path_where_needs_to_export, dataset_checks=dataset_checks,
+                allow_empty=critical_priorities is not None,
+            )
         if critical_priorities is not None:
             _write_selected_priority_csv(
                 output_path, critical_priorities, expectations, dataset_checks,
@@ -984,6 +992,8 @@ def _export_format(path_where_needs_to_export):
     if (not isinstance(path_where_needs_to_export, (str, os.PathLike))
             or not os.fspath(path_where_needs_to_export)):
         raise ValueError("An output file or directory path is required")
+    if str(path_where_needs_to_export).lower().endswith(".gx.json"):
+        return "gx"
     suffix = Path(path_where_needs_to_export).suffix.lower()
     return "yaml" if suffix in _YAML_SUFFIXES else "json"
 
@@ -1001,6 +1011,8 @@ def _yaml_scalar(value):
 def write_expectations(expectations, path_where_needs_to_export, *, table_name=None,
                        dataset_checks=None, allow_empty=False):
     export_format = _export_format(path_where_needs_to_export)
+    if export_format == "gx":
+        raise ValueError("Use DataBuck.discover(...) or rules.to_lake(...) for GX export")
     output = Path(path_where_needs_to_export)
     dataset_checks = dataset_checks or {}
     if export_format == "yaml":

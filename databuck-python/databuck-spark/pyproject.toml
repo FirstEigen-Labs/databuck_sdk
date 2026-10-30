@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "databuck-sdk"
-version = "0.5.46"
+version = "0.5.48"
 description = "DataBuck data quality SDK for PySpark and Databricks"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,9 +22,13 @@ classifiers = [
 dependencies = [
   "google-genai>=1.0.0",
 ]
+
 authors = [
   { name = "DataBuck" }
 ]
+
+[project.optional-dependencies]
+gx = ["great_expectations>=1.0,<2"]
 
 [project.urls]
 Repository = "https://github.com/FirstEigen-Labs/databuck_sdk"
