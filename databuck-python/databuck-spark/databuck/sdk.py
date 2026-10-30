@@ -13,7 +13,7 @@ from pathlib import Path
 
 JAR_URL = "https://tmplog1-pub.s3.us-east-1.amazonaws.com/databuck-sdk.jar"
 JAR_NAME = "databuck-sdk.jar"
-JAR_SHA256 = "c85e35442f9416bdfbe69d66e3e786affa3b1861d526a1cf363bb25a34f470e6"
+JAR_SHA256 = "2c25990fd5f0e6d6eec8302844637cd8d1f26d9afb9f0b0056b23eb9f7d56008"
 
 
 def _jar_setting(name, default=None):
