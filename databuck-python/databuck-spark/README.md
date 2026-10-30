@@ -1,4 +1,4 @@
-# databuck-spark-sdk
+# databuck-sdk
 
 Python wrapper for the DataBuck Spark SDK. It discovers data-quality rules from
 an existing Spark DataFrame or a registered Spark table and exports expectations
@@ -8,8 +8,16 @@ data is published.
 ## Install
 
 ```bash
-python -m pip install databuck-spark-sdk
+python -m pip install databuck-sdk
 python -c "import databuck"
+```
+
+If `databuck-spark-sdk` is installed, remove it before installing this package;
+both distributions provide the same `databuck` Python import:
+
+```bash
+python -m pip uninstall databuck-spark-sdk
+python -m pip install --upgrade databuck-sdk
 ```
 
 Importing `databuck` downloads `databuck-spark-sdk.jar` from the DataBuck S3
@@ -38,7 +46,7 @@ Python package version with its new hash, or set
 Run this once in the notebook to install the Python package:
 
 ```python
-%pip install databuck-spark-sdk
+%pip install databuck-sdk
 ```
 
 After installing or upgrading, restart Python in the next cell so the notebook
@@ -55,7 +63,7 @@ before importing `databuck`:
 import os
 from importlib.metadata import version
 
-print(version("databuck-spark-sdk"))
+print(version("databuck-sdk"))
 
 os.environ["DATABUCK_SPARK_SDK_JAR"] = (
     "/Volumes/catalog/schema/volume/databuck-spark-sdk.jar"
@@ -145,44 +153,17 @@ in your workspace. The table-name option uses the notebook's Spark session and
 requires read access to the registered table; it does not take separate database
 connection details. Passing an existing DataFrame avoids reading the table again.
 
-The single call runs profile discovery and context-aware BuckGPT discovery,
-then writes both sets of row expectations into one file. The output extension
-selects JSON or YAML. Context-aware expectations are named `BuckGPT_Rule_001`,
-`BuckGPT_Rule_002`, etc. Their
-invalid-row SQL queries are converted to Lakeflow pass conditions. Audited,
-passed row-level BuckGPT rules must use
-`SELECT * FROM {{DATAFRAME}} WHERE <invalid-row condition>`; an unsupported
-row-level query fails the export. Audited uniqueness checks use the separate
-`dataset_checks` section described below.
-The call prints the auto-discovered rules and the BuckGPT rules before it
-exports them. Some auto-discovered rules may not be exportable as row-level
-Lakeflow expectations; the export contains only those that can be converted.
-Each printed BuckGPT rule shows either its supporting document and reference
-quote or `BuckGPT_Intel` and its general business rationale.
-The exported JSON and YAML files contain the rule conditions. When
-`domain_name` is supplied, business-critical selection applies only to
-exportable auto-discovered rules. Audited BuckGPT rules bypass this reduction
-and remain in the export. The notebook prints the retained auto-discovered
-count and each selected rule's HIGH, MEDIUM, or LOW business priority.
-Priorities appear only in the notebook log, not in exported JSON or YAML.
-This selection has no fixed rule count.
-Within one notebook Python session, repeated selection with the same domain,
-business context, schema, model, and auto-discovered checks reuses the first
-result. Candidate IDs are stable even if discovery returns those checks in a
-different order. A new Python session makes a new Gemini selection.
-The `pdf_paths` field accepts both `.pdf` and `.docx` files accessible on the
-notebook driver. PDF files are uploaded to Gemini; text from Word documents is
-extracted locally and included in the generation and audit prompts. Images or
-scanned pages in a Word document are not read.
-BuckGPT generates document-backed rules from the supplied references and
-general rules labeled `BuckGPT_Intel`.
-BuckGPT rules are audited and exported alongside the selected auto-discovered
-rules. General rules can include non-negative and cross-column checks. When
-BuckGPT identifies a defensible unique business key, the JSON or YAML export
-places its duplicate-group SQL in `dataset_checks`. Run these checks against
-the full dataset separately, replacing `{{DATAFRAME}}` with the source table
-or view name. They are not Lakeflow row expectations and do not receive
-warn/drop/fail actions. `rule_count` is no longer needed.
+The call combines automatic and policy-informed rules. The output extension
+selects JSON or YAML. With `domain_name`, JSON and YAML contain selected HIGH
+and MEDIUM rules from both sources. The SDK writes `*_all_rules.csv` for review
+and `*_high_medium_rules.csv` beside the output file for the selected rules.
+The selected-rules CSV includes rule names, expressions, sources, and
+priorities.
+
+`pdf_paths` accepts PDF and DOCX files available to the notebook. For a
+dataset-level uniqueness rule, the output includes a `dataset_checks` section.
+Run its SQL against the full dataset separately, replacing `{{DATAFRAME}}` with
+your source table or view. Dataset checks are not Lakeflow row expectations.
 
 To export only automatic profiling rules, omit `context`:
 
@@ -192,20 +173,11 @@ json_path = DataBuck.discover(
 )
 ```
 
-Without context, BuckGPT is not called. In JSON, all exported rules use `warn`.
-If `context` contains only Gemini settings, JSON export skips BuckGPT rule
-generation and uses Gemini only to classify the automatic rules. To generate
-BuckGPT rules, include an explicit business statement (for example in
-`business_context`) or a PDF/DOCX policy path. An API key alone does not
-describe a business rule.
+Without context, the output contains automatic rules and JSON places them in
+the `warn` group. To include policy-informed rules, pass a business statement
+or policy document along with the Gemini API key.
 
-The JSON contains three action dictionaries: `warn`, `drop`, and `fail`. For JSON
-exports with `context`, Gemini classifies exported expectations using the rule
-expression, DataFrame schema, and up to five sample rows. The PDF and DOCX
-files support BuckGPT rule
-generation and audit; they are not passed again to action classification. The
-schema and sample are sent to Gemini. If its response is incomplete or invalid,
-export fails instead of assigning a destructive action.
+The JSON contains three action dictionaries: `warn`, `drop`, and `fail`.
 In a Databricks Lakeflow Declarative Pipeline, use the dictionaries with
 `dp.expect_all`, `dp.expect_all_or_drop`, and `dp.expect_all_or_fail`,
 respectively.
@@ -268,7 +240,7 @@ policy changes, then refresh the pipeline.
 }
 ```
 
-The example shows the file shape; the actual actions are chosen by Gemini.
+The example shows the file shape; actual actions depend on the generated rules.
 
 ## Export flat YAML expectations
 
@@ -323,7 +295,7 @@ expectations:
   BuckGPT_Rule_001: "NOT COALESCE((subscription_status_cd = 'INVALID'), FALSE)"
 ```
 
-YAML combines automatic and audited BuckGPT rules under `expectations` without
+YAML combines automatic and policy-informed rules under `expectations` without
 `warn`, `drop`, or `fail` groups. It does not call the action classifier. Use
 JSON when the pipeline needs those action groups.
 Omit `context` to write only automatically discovered rules.
@@ -359,11 +331,5 @@ exporting. For compatibility, `DataBuck.discover(df, context_dict)` still
 returns BuckGPT rules without exporting. Pass an output file path as the second
 argument to `DataBuck.discover(...)` to combine discovery and export.
 
-In JSON, each action dictionary maps expectation names to Spark SQL pass conditions,
-such as `{"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"}`. Null, pattern,
-and length rules are converted from their profiling metadata, including rules
-from older SDK JARs whose `expression` field is empty. Dataset-level rules
-and catalog rules without a row condition remain in `rules` but are omitted
-from the file. Null rules are exported only when their threshold is 0%.
-The export does not encode aggregate failure thresholds. Profiling pattern
-`A` maps to `[A-Z]`, and `#` maps to `[0-9]`.
+In JSON, each action dictionary maps expectation names to Spark SQL pass
+conditions, such as `{"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"}`.

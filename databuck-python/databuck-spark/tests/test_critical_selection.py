@@ -373,7 +373,7 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertEqual(len(selected), 98)
         self.client.models.generate_content.assert_called_once()
         prompt = self.client.models.generate_content.call_args.kwargs["contents"]
-        self.assertIn("Select at most 98 rules", prompt)
+        self.assertIn("Select at most 98 HIGH or MEDIUM rules", prompt)
         self.assertIn("79-column DataFrame", prompt)
         self.assertIn("auto-discovered and audited BuckGPT", prompt)
 
@@ -399,7 +399,7 @@ class CriticalSelectionTests(unittest.TestCase):
         self.assertIn("BuckGPT_Rule_001", selected)
         self.assertEqual(self.client.models.generate_content.call_count, 2)
         retry_prompt = self.client.models.generate_content.call_args.kwargs["contents"]
-        self.assertIn("selected 6 rules; limit is 5", retry_prompt)
+        self.assertIn("selected 6 HIGH/MEDIUM rules; limit is 5", retry_prompt)
 
     def test_selection_does_not_trim_an_over_limit_retry(self):
         self.df.schema.fields = [Mock() for _ in range(4)]
@@ -409,12 +409,31 @@ class CriticalSelectionTests(unittest.TestCase):
             {"id": index, "priority": "HIGH"} for index in range(1, 7)
         ])
         with patch.dict(sys.modules, self.modules):
-            with self.assertRaisesRegex(ValueError, "selected 6 rules; limit is 5"):
+            with self.assertRaisesRegex(ValueError, "selected 6 HIGH/MEDIUM rules; limit is 5"):
                 _select_critical_expectations(
                     expectations, self.df,
                     {"domain_name": "banking", "gemini_api_key": "test-key"}, [],
                 )
         self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_low_rules_do_not_consume_high_medium_export_limit(self):
+        self.df.schema.fields = [Mock() for _ in range(4)]  # export limit = 5
+        expectations = {"rule_{}".format(index): "field_{} > 0".format(index)
+                        for index in range(6)}
+        self.client.models.generate_content.return_value.text = json.dumps([
+            {"id": index, "priority": "HIGH"} for index in range(1, 6)
+        ] + [{"id": 6, "priority": "LOW"}])
+        with patch.dict(sys.modules, self.modules):
+            priorities = {}
+            selected = _select_critical_expectations(
+                expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"}, [],
+                priority_output=priorities,
+            )
+        self.assertEqual(len(selected), 6)
+        self.assertEqual(sum(value in {"HIGH", "MEDIUM"}
+                             for value in priorities.values()), 5)
+        self.client.models.generate_content.assert_called_once()
 
     def test_profile_metadata_excludes_sample_values(self):
         metadata = _profile_rule_metadata([

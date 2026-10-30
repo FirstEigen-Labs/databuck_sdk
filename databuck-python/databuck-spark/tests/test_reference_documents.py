@@ -123,11 +123,9 @@ class ReferenceDocumentTests(unittest.TestCase):
         self.assertNotIn('[10]', policy)
         self.assertNotIn('[50]', general)
         for prompt in (policy, general, cross_column):
-            normalized = " ".join(prompt.split())
-            self.assertIn("maximum selected-rule count of 1", normalized)
-            self.assertIn("Java auto-discovery and all BuckGPT phases", normalized)
-            self.assertIn("1-column DataFrame", normalized)
-        self.assertNotIn("60\nor more distinct rules", general)
+            self.assertNotIn("maximum selected-rule count", prompt)
+            self.assertNotIn("1.25 times the column count", prompt)
+        self.assertIn("60\nor more distinct rules", general)
         self.assertIn("involving 2 to 4 columns", general)
         self.assertIn("non-positive checks where positive values are semantically impossible", general)
         self.assertIn("do not assume all amounts, counts, balances, or adjustments", general)
@@ -374,8 +372,8 @@ class ReferenceDocumentTests(unittest.TestCase):
             self.assertIn("Source document: banking_policy.pdf", output.getvalue())
             self.assertEqual(generate.call_args.kwargs["allowed_sources"],
                              {path.name, "BuckGPT_Intel"})
-            self.assertIn("maximum selected-rule count of 2",
-                          generate.call_args.kwargs["prompt"])
+            self.assertNotIn("maximum selected-rule count",
+                             generate.call_args.kwargs["prompt"])
             self.assertNotIn("rule_count", generate.call_args.kwargs)
 
     def test_policy_prompt_excludes_general_source(self):

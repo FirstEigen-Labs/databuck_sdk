@@ -7,15 +7,19 @@ and publishes them to PyPI without a manually created API token.
 
 For the first release, add a pending trusted publisher on PyPI with:
 
-- PyPI project name: `databuck-spark-sdk`
+- PyPI project name: `databuck-sdk`
 - Owner: `FirstEigen-Labs`
 - Repository name: `databuck_sdk`
 - Workflow name: `publish.yml`
 - Environment name: leave blank
 
 Commit and push the workflow to `main` before running it. Then in GitHub, open
-**Actions → Publish databuck-spark-sdk to PyPI → Run workflow**, select `main`,
+**Actions → Publish databuck-sdk to PyPI → Run workflow**, select `main`,
 and start the run. Check its result and the new release on PyPI.
+
+This is a separate PyPI project from `databuck-spark-sdk`. Configure a new
+pending trusted publisher for `databuck-sdk`; the old project's publisher does
+not grant access to the new name. The Python import remains `databuck`.
 
 Each PyPI release needs a new version in `pyproject.toml`; release files for an
 existing version cannot be overwritten. Review the version and source changes

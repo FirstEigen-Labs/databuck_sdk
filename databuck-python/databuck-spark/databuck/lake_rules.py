@@ -580,10 +580,11 @@ below. Select only
 the rules whose failure would materially affect business decisions, regulatory
 or policy compliance, financial correctness, customer outcomes, or the ability
 to use this dataset for its stated business purpose.
-Select at most {max_selected} rules in total across both sources and all
-priorities for this {column_count}-column DataFrame (floor of 1.25 times the
-column count). This is a ceiling, not a target. Return fewer when fewer are
-defensible; choose by evidence and business value, not candidate order.
+Select at most {max_selected} HIGH or MEDIUM rules across both sources for this
+{column_count}-column DataFrame (floor of 1.25 times the column count). LOW
+rules are not exported and do not count against this ceiling. This is a
+ceiling, not a target. Return fewer when fewer are defensible; choose by
+evidence and business value, not candidate order.
 
 Evaluate each rule in the supplied business context. A generic completeness
 check on a technical ID is often low value; do not select it merely because
@@ -753,9 +754,11 @@ def _parse_critical_profile_selection(response_text, expectations, max_selected=
         if name in priorities:
             raise ValueError("duplicate candidate ID: {}".format(rule_id))
         priorities[name] = priority.upper()
-    if max_selected is not None and len(priorities) > max_selected:
-        raise ValueError("selected {} rules; limit is {}".format(
-            len(priorities), max_selected))
+    exportable_count = sum(priority in {"HIGH", "MEDIUM"}
+                           for priority in priorities.values())
+    if max_selected is not None and exportable_count > max_selected:
+        raise ValueError("selected {} HIGH/MEDIUM rules; limit is {}".format(
+            exportable_count, max_selected))
     return priorities
 
 
