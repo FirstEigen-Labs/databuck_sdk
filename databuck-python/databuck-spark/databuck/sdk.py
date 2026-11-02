@@ -1,6 +1,4 @@
-import csv
 import hashlib
-import json
 import os
 import sys
 import tempfile
@@ -1379,51 +1377,10 @@ class DataBuck:
             DataBuck._discover_context_rules(df, context)
             if context is not None and has_rule_reference_context(context) else None
         )
-        output_path = rules.to_lake(
+        return rules.to_lake(
             path, df=export_df, context=context, context_rules=context_rules,
             table_name=table_name
         )
-        csv_path = Path(output_path).with_name(
-            "{}_all_rules.csv".format(Path(output_path).stem)
-        )
-        fieldnames = (
-            "source", "rule_id", "rule_type", "column_name", "rule_name",
-            "expression", "threshold", "parameters", "description",
-            "source_document", "reference_context", "sql", "check_type",
-            "columns", "audit_status", "audit_reason",
-        )
-        with csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=fieldnames)
-            writer.writeheader()
-            for rule in rules:
-                writer.writerow({
-                    "source": "AutoDiscovery",
-                    "rule_id": rule.get("ruleId"),
-                    "rule_type": rule.get("ruleType"),
-                    "column_name": rule.get("columnName"),
-                    "rule_name": rule.get("ruleName"),
-                    "expression": rule.get("expression"),
-                    "threshold": rule.get("threshold"),
-                    "parameters": json.dumps(rule.get("parameters") or {},
-                                             ensure_ascii=False, default=str),
-                })
-            for index, rule in enumerate(context_rules or (), start=1):
-                writer.writerow({
-                    "source": "BuckGPT",
-                    "rule_name": rule.get("name") or "BuckGPT_Rule_{:03d}".format(index),
-                    "description": rule.get("description"),
-                    "source_document": rule.get("source_document"),
-                    "reference_context": rule.get("reference_context"),
-                    "sql": rule.get("sql"),
-                    "check_type": rule.get("check_type"),
-                    "columns": json.dumps(rule.get("columns") or [],
-                                          ensure_ascii=False),
-                    "audit_status": rule.get("audit_status"),
-                    "audit_reason": rule.get("audit_reason"),
-                })
-        print("DataBuck: saved all {} discovered rules to {}".format(
-            len(rules) + len(context_rules or ()), csv_path), flush=True)
-        return output_path
 
     # ------------------------------------------------------------------
     # COUNT

@@ -51,8 +51,7 @@ PDF and DOCX policy files are accepted in `pdf_paths`.
 
 Discovery combines automatic and policy-informed rules. With `domain_name`,
 the output contains selected HIGH and MEDIUM rules. JSON groups row rules by
-`warn`, `drop`, and `fail`; YAML lists them without action groups. The SDK also
-writes a CSV of the selected rules beside the output file.
+`warn`, `drop`, and `fail`; YAML lists them without action groups.
 
 See the [Python SDK README](databuck-python/databuck-spark/README.md) for full
 setup, JSON and YAML examples, and Lakeflow pipeline usage.

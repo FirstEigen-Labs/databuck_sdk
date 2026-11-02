@@ -180,10 +180,7 @@ connection details. Passing an existing DataFrame avoids reading the table again
 
 The call combines automatic and policy-informed rules. The output extension
 selects JSON or YAML. With `domain_name`, JSON and YAML contain selected HIGH
-and MEDIUM rules from both sources. The SDK writes `*_all_rules.csv` for review
-and `*_high_medium_rules.csv` beside the output file for the selected rules.
-The selected-rules CSV includes rule names, expressions, sources, and
-priorities.
+and MEDIUM rules from both sources.
 
 `pdf_paths` accepts PDF and DOCX files available to the notebook. For a
 dataset-level uniqueness rule, the output includes a `dataset_checks` section.
