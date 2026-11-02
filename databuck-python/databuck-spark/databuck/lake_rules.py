@@ -55,7 +55,7 @@ class DiscoveredRules(list):
             aggregates = []
             for column, _ in specs:
                 mean_name, std_name = _anomaly_stat_columns(column)
-                numeric = F.col(_quoted_column(column)).cast("double")
+                numeric = F.expr("TRY_CAST({} AS DOUBLE)".format(_quoted_column(column)))
                 aggregates.extend((F.avg(numeric).alias(mean_name),
                                    F.stddev_samp(numeric).alias(std_name)))
             stats = df.agg(*aggregates).first()
@@ -189,8 +189,9 @@ class DiscoveredRules(list):
             identifier = _quoted_column(column)
             mean, std = self._value_anomaly_baselines[column]
             _add(expectations, "valid_value", column,
-                 "{} IS NULL OR ABS(CAST({} AS DOUBLE) - {}) <= {} * {}".format(
-                     identifier, identifier, format(mean, ".17g"),
+                  "TRY_CAST({} AS DOUBLE) IS NULL OR "
+                  "ABS(TRY_CAST({} AS DOUBLE) - {}) <= {} * {}".format(
+                      identifier, identifier, format(mean, ".17g"),
                      format(threshold, ".15g"), format(std, ".17g")))
 
         auto_expectation_names = set(expectations)

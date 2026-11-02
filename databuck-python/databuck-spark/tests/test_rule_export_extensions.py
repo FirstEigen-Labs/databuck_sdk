@@ -36,7 +36,9 @@ class RuleExportExtensionTests(unittest.TestCase):
         names = {"valid_date_event_date", "valid_value_amount"}
         self.assertEqual(set(json_doc["warn"]), names)
         self.assertIn("TRY_TO_TIMESTAMP", json_doc["warn"]["valid_date_event_date"])
-        self.assertIn("ABS(CAST(`amount` AS DOUBLE) - 15) <= 3 * 7.0710678118654755",
+        self.assertIn("TRY_CAST(`amount` AS DOUBLE) IS NULL OR ",
+                      json_doc["warn"]["valid_value_amount"])
+        self.assertIn("ABS(TRY_CAST(`amount` AS DOUBLE) - 15) <= 3 * 7.0710678118654755",
                       json_doc["warn"]["valid_value_amount"])
         self.assertNotIn("preparation", json_doc)
         self.assertIn("table: catalog.schema.events", yaml_text)

@@ -216,7 +216,7 @@ class CombinedExportTests(unittest.TestCase):
             self.assertEqual(set(exported["drop"]), {
                 "valid_value_monthly_charge_usd", "valid_value_data_usage_gb"
             })
-            self.assertIn("ABS(CAST(`monthly_charge_usd` AS DOUBLE) - 50) <= 3 * 5",
+            self.assertIn("ABS(TRY_CAST(`monthly_charge_usd` AS DOUBLE) - 50) <= 3 * 5",
                           exported["drop"]["valid_value_monthly_charge_usd"])
             self.assertNotIn("preparation", exported)
 
