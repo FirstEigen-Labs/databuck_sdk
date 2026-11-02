@@ -5,6 +5,11 @@ root. It runs only when manually started on `main`. It tests and builds the
 Python package from `databuck-python/databuck-spark/`, checks the distributions,
 and publishes them to PyPI without a manually created API token.
 
+Before running the workflow, set the GitHub Actions repository secret
+`DATABUCK_CI_LICENSE` to the full contents of a signed `databucksdk.properties`
+file issued for CI. The build job uses this license while running tests; it
+does not need the private signing PEM. Renew the CI license before it expires.
+
 For the first release, add a pending trusted publisher on PyPI with:
 
 - PyPI project name: `databuck-sdk`
