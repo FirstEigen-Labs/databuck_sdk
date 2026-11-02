@@ -40,8 +40,14 @@ print(output_path)
 You can pass an existing Spark DataFrame in place of the table name. An output
 path ending in `.json` creates `warn`, `drop`, and `fail` expectation groups;
 `.yaml` or `.yml` creates a flat `expectations` mapping; `.gx.json` creates a
-Great Expectations suite. Install `databuck-sdk[gx]` for GX export. PDF and
-DOCX policy files are accepted in `pdf_paths`.
+Great Expectations suite. For GX export in Databricks, install Great
+Expectations separately:
+
+```python
+%pip install "great-expectations>=1.0,<2"
+```
+
+PDF and DOCX policy files are accepted in `pdf_paths`.
 
 Discovery combines automatic and policy-informed rules. With `domain_name`,
 the output contains selected HIGH and MEDIUM rules. JSON groups row rules by

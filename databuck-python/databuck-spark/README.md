@@ -9,7 +9,26 @@ data is published.
 
 ```bash
 python -m pip install databuck-sdk
-python -c "import databuck"
+```
+
+Give each customer one signed `databucksdk.properties` file:
+
+```properties
+customer_id=your-customer-id
+issued_on=2026-11-02
+expires_on=2027-12-31
+license_key=signed-key-created-by-the-issuer
+```
+
+Set `DATABUCK_SDK_CONFIG_FILE` to its local path before importing the SDK.
+The license is valid through its `expires_on` date, inclusive. Renew it with
+a newly issued config file when it expires. Editing the dates or customer ID
+invalidates the signature.
+
+```python
+import os
+os.environ["DATABUCK_SDK_CONFIG_FILE"] = "/path/to/databucksdk.properties"
+from databuck import DataBuck
 ```
 
 If `databuck-spark-sdk` is installed, remove it before installing this package;
@@ -67,6 +86,9 @@ print(version("databuck-sdk"))
 
 os.environ["DATABUCK_SDK_JAR"] = (
     "/Volumes/catalog/schema/volume/databuck-sdk.jar"
+)
+os.environ["DATABUCK_SDK_CONFIG_FILE"] = (
+    "/Volumes/catalog/schema/volume/databucksdk.properties"
 )
 
 from databuck import DataBuck  # Downloads the JAR to that path on first import.
@@ -339,11 +361,15 @@ conditions, such as `{"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"}`.
 
 ## Export a Great Expectations suite
 
-Install the GX extra, then give `DataBuck.discover` a path ending in `.gx.json`:
+After installing `databuck-sdk`, install Great Expectations separately in the
+Databricks notebook:
 
 ```python
-%pip install "databuck-sdk[gx]"
+%pip install "great-expectations>=1.0,<2"
 ```
+
+Restart Python, set the SDK config and JAR paths again, then give
+`DataBuck.discover` a path ending in `.gx.json`:
 
 ```python
 gx_path = DataBuck.discover(

@@ -8,7 +8,10 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from functools import wraps
 from pathlib import Path
+
+from .license import require_license
 
 
 JAR_URL = "https://tmplog1-pub.s3.us-east-1.amazonaws.com/databuck-sdk.jar"
@@ -22,6 +25,25 @@ def _jar_setting(name, default=None):
             or default)
 
 
+def _licensed_methods(cls):
+    """Check the current license whenever a public SDK operation is used."""
+    def licensed(method):
+        @wraps(method)
+        def checked(*args, **kwargs):
+            require_license()
+            return method(*args, **kwargs)
+
+        return staticmethod(checked)
+
+    for name, member in vars(cls).copy().items():
+        if (name.startswith("_") or name in ("download_jar", "jar_path")
+                or not isinstance(member, staticmethod)):
+            continue
+        setattr(cls, name, licensed(member.__func__))
+    return cls
+
+
+@_licensed_methods
 class DataBuck:
 
     @staticmethod
