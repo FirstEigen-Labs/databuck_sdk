@@ -28,6 +28,7 @@ _PROFILE_METADATA_PARAMETERS = {
 }
 _CRITICAL_SELECTION_CACHE = {}
 _DUPLICATE_SELECTION_CACHE = {}
+_COMBINED_REVIEW_CACHE = {}
 
 
 class DiscoveredRules(list):
@@ -241,25 +242,28 @@ class DiscoveredRules(list):
                 }
                 metadata.append({"expectation_name": name, **buckgpt_metadata[name]})
             if len(expectations) > 1:
-                print("DataBuck: reviewing duplicate rules ({} auto-discovered, "
-                      "{} BuckGPT)".format(auto_expectation_count,
-                                             len(context_rules or ())), flush=True)
-                removed = _identify_duplicate_expectations(
+                print("DataBuck: reviewing duplicates and selecting critical rules "
+                      "({} auto-discovered, {} BuckGPT candidates)".format(
+                          len(auto_expectation_names.intersection(expectations)),
+                          len(set(expectations) - auto_expectation_names)), flush=True)
+                removed, critical_priorities = _review_duplicates_and_critical_rules(
                     expectations, df, context, metadata, auto_expectation_names,
                 )
                 expectations = {name: expression for name, expression in expectations.items()
                                 if name not in removed}
                 print("DataBuck: removed {} duplicate rules; {} remain".format(
                     len(removed), len(expectations)), flush=True)
-            print("DataBuck: selecting critical rules ({} auto-discovered, "
-                  "{} BuckGPT candidates)".format(
-                      len(auto_expectation_names.intersection(expectations)),
-                      len(set(expectations) - auto_expectation_names)), flush=True)
-            critical_priorities = {}
-            selected = _select_critical_expectations(
-                expectations, df, context, metadata,
-                priority_output=critical_priorities,
-            )
+            else:
+                print("DataBuck: selecting critical rules ({} auto-discovered, "
+                      "{} BuckGPT candidates)".format(
+                          len(auto_expectation_names.intersection(expectations)),
+                          len(set(expectations) - auto_expectation_names)), flush=True)
+                critical_priorities = {}
+                _select_critical_expectations(
+                    expectations, df, context, metadata,
+                    priority_output=critical_priorities,
+                )
+            selected = set(critical_priorities)
             selected_for_export = {name for name in selected
                                    if critical_priorities.get(name) in {"HIGH", "MEDIUM"}}
             expectations = {name: expression for name, expression in expectations.items()
@@ -503,6 +507,166 @@ Candidates (no sample records): {candidates}
     return set()
 
 
+def _parse_combined_review(response_text, expectations, dataset_names,
+                           max_selected):
+    try:
+        result = json.loads(response_text.strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError("response is not valid JSON") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("duplicates"), list) \
+            or not isinstance(result.get("selected"), list):
+        raise ValueError("response needs duplicates and selected lists")
+    removed = _parse_duplicate_selection(
+        json.dumps(result["duplicates"]), sorted(expectations), dataset_names,
+    )
+    priorities = _parse_critical_profile_selection(
+        json.dumps(result["selected"]), expectations, max_selected=max_selected,
+    )
+    if removed.intersection(priorities):
+        raise ValueError("a removed duplicate cannot also be selected")
+    return removed, priorities
+
+
+def _review_duplicates_and_critical_rules(expectations, df, context, metadata,
+                                          auto_expectation_names):
+    """Use one review for duplicate removal and critical selection.
+
+    If its structured response stays invalid after one retry, run the original
+    separate reviews so export still follows the established path.
+    """
+    domain_name = context.get("domain_name")
+    if not isinstance(domain_name, str) or not domain_name.strip():
+        raise ValueError("context['domain_name'] must be a non-empty string")
+    api_key = str(context.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError("Set context['gemini_api_key'] or GEMINI_API_KEY to review rules")
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise ImportError("Combined rule review requires google-genai") from exc
+
+    max_selected = (5 * len(df.schema.fields)) // 4
+    metadata_by_name = {item["expectation_name"]: item for item in metadata
+                        if item.get("expectation_name") in expectations}
+    dataset_names = {name for name, item in metadata_by_name.items()
+                     if item.get("check_type") == "uniqueness"}
+    candidates = [{
+        "id": index,
+        "name": name,
+        "source": "AutoDiscovery" if name in auto_expectation_names else "BuckGPT",
+        "check": expectations[name],
+        "metadata": metadata_by_name.get(name),
+    } for index, name in enumerate(sorted(expectations), start=1)]
+    business_context = {key: value for key, value in context.items()
+                        if key not in {"gemini_api_key", "gemini_model", "pdf_paths",
+                                       "rule_count", "include_failed_rules", "domain_name"}}
+    prompt = """Act as an independent review committee: a {domain_name} subject matter
+expert, a {domain_name} data engineer, and a data quality governance lead.
+Review the DataBuck auto-discovered and audited BuckGPT candidates in two steps.
+
+First, identify only genuinely duplicate controls: checks on the same columns
+that detect the same failure with equivalent conditions. Compare scope, null
+behavior, thresholds, and conditional applicability. Pattern and length checks
+on the same column are not automatically duplicates. A dataset uniqueness
+check cannot duplicate a row check. Keep the clearer, better supported, or
+more precise rule. Do not remove a rule merely because it has low business
+priority or shares a column with another rule.
+
+Second, select critical and high-value rules from the surviving candidates.
+Judge business value independently of rule origin. Retain rules with a
+concrete, supported consequence for regulatory or policy compliance,
+financial correctness, customer outcomes, business decisions, or a critical
+operational process. Check lifecycle semantics, legitimate zero or missing
+values, precision, rounding, false-positive risk, and whether the rule is
+actionable and adds distinct detection value. Do not treat observed patterns,
+column names, or unsupported thresholds as business requirements. A generic
+technical-ID completeness check is often low value; a key can be critical
+when missing values break identity, joins, reconciliation, or a required
+process. Keep pattern and length checks together only when each catches a
+distinct material failure. Exclude speculative, redundant, and
+confirmation-dependent checks. Choose the smallest defensible set; do not
+fill a quota.
+
+Assign HIGH to immediate material regulatory, financial, customer, or
+operational impact; MEDIUM to material but less urgent impact; LOW to a
+worthwhile lower-priority review. LOW rules are not exported. Select at most
+{max_selected} HIGH or MEDIUM rules across both sources for this
+{column_count}-column DataFrame (floor of 1.25 times column count). This is
+a ceiling, not a target. Use only the candidate IDs below and no sample rows.
+
+Return only a JSON object with exactly these lists:
+{{"duplicates": [{{"remove_id": 2, "keep_id": 1,
+"reason": "Equivalent check on the same columns"}}],
+"selected": [{{"id": 1, "priority": "HIGH"}}]}}
+Every keep_id must remain; never remove it elsewhere or remove an ID twice.
+Do not select a removed ID. Return empty lists when appropriate. Do not
+create rules, names, SQL, or additional commentary.
+
+Business context: {context}
+DataFrame schema: {schema}
+Candidates (no sample records): {candidates}
+""".format(
+        domain_name=domain_name.strip(), max_selected=max_selected,
+        column_count=len(df.schema.fields),
+        context=json.dumps(business_context, default=str, ensure_ascii=False,
+                           sort_keys=True),
+        schema=df.schema.json(),
+        candidates=json.dumps(candidates, default=str, ensure_ascii=False,
+                              sort_keys=True),
+    )
+    model = context.get("gemini_model", "gemini-2.5-flash")
+    print("DataBuck: critical selection limit {} for {} columns".format(
+        max_selected, len(df.schema.fields)), flush=True)
+    cache_key = hashlib.sha256(
+        "{}\0{}\0{}".format(api_key, model, prompt).encode("utf-8")
+    ).hexdigest()
+    cached = _COMBINED_REVIEW_CACHE.get(cache_key)
+    if cached is not None:
+        print("DataBuck: reusing duplicate and critical review for unchanged inputs",
+              flush=True)
+        removed, priorities = cached
+        return set(removed), dict(priorities)
+
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(
+        temperature=0.0, response_mime_type="application/json",
+    )
+    retry_reason = None
+    for attempt in range(2):
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt if attempt == 0 else prompt + (
+                "\nYour previous response was invalid: {}. Return a JSON object "
+                "with valid duplicates and selected lists using candidate IDs."
+            ).format(retry_reason),
+            config=config,
+        )
+        try:
+            removed, priorities = _parse_combined_review(
+                response.text or "", expectations, dataset_names, max_selected,
+            )
+            if len(_COMBINED_REVIEW_CACHE) >= 32:
+                del _COMBINED_REVIEW_CACHE[next(iter(_COMBINED_REVIEW_CACHE))]
+            _COMBINED_REVIEW_CACHE[cache_key] = (frozenset(removed), dict(priorities))
+            return removed, priorities
+        except ValueError as exc:
+            retry_reason = str(exc)
+
+    print("DataBuck: combined review invalid after one retry; using separate "
+          "duplicate and critical reviews ({})".format(retry_reason), flush=True)
+    removed = _identify_duplicate_expectations(
+        expectations, df, context, metadata, auto_expectation_names,
+    )
+    retained = {name: expression for name, expression in expectations.items()
+                if name not in removed}
+    priorities = {}
+    _select_critical_expectations(
+        retained, df, context, metadata, priority_output=priorities,
+    )
+    return removed, priorities
+
+
 def _select_critical_expectations(expectations, df, context, profile_metadata,
                                   priority_output=None):
     domain_name = context.get("domain_name")
@@ -646,9 +810,6 @@ Auto-discovered and BuckGPT candidates (no sample records):
             priority_output.update(cached_priorities)
         print("DataBuck: reusing critical rule selection for unchanged inputs",
               flush=True)
-        for name, priority in cached_priorities.items():
-            print("DataBuck: critical rule [{}] {}".format(priority, name),
-                  flush=True)
         return set(cached_priorities)
 
     client = genai.Client(api_key=api_key)
@@ -676,9 +837,6 @@ Auto-discovered and BuckGPT candidates (no sample records):
             _CRITICAL_SELECTION_CACHE[cache_key] = priorities
             if priority_output is not None:
                 priority_output.update(priorities)
-            for name, priority in priorities.items():
-                print("DataBuck: critical rule [{}] {}".format(priority, name),
-                      flush=True)
             return set(priorities)
         except ValueError as exc:
             retry_reason = str(exc)

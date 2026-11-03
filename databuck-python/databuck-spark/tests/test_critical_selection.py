@@ -11,9 +11,10 @@ os.environ.setdefault("DATABUCK_SDK_AUTO_DOWNLOAD", "0")
 
 from databuck.agentic_rules import has_rule_reference_context
 from databuck.lake_rules import (
-    _CRITICAL_SELECTION_CACHE, _DUPLICATE_SELECTION_CACHE,
+    _COMBINED_REVIEW_CACHE, _CRITICAL_SELECTION_CACHE, _DUPLICATE_SELECTION_CACHE,
     _classify_actions_with_llm, _parse_rule_action_overrides,
-    _identify_duplicate_expectations, _parse_duplicate_selection,
+    _identify_duplicate_expectations, _parse_combined_review,
+    _parse_duplicate_selection, _review_duplicates_and_critical_rules,
     _profile_rule_metadata, _select_critical_expectations,
 )
 
@@ -22,6 +23,7 @@ class CriticalSelectionTests(unittest.TestCase):
     def setUp(self):
         _CRITICAL_SELECTION_CACHE.clear()
         _DUPLICATE_SELECTION_CACHE.clear()
+        _COMBINED_REVIEW_CACHE.clear()
         self.df = Mock()
         self.df.schema.fields = [Mock(), Mock()]
         self.df.schema.json.return_value = '{"fields":[]}'
@@ -102,7 +104,7 @@ class CriticalSelectionTests(unittest.TestCase):
                 )
         self.assertEqual(self.client.models.generate_content.call_count, 2)
 
-    def test_selection_prints_priorities_without_changing_rules(self):
+    def test_selection_does_not_print_individual_rules(self):
         self.client.models.generate_content.return_value.text = (
             '[{"id":1,"priority":"MEDIUM"}]'
         )
@@ -114,8 +116,7 @@ class CriticalSelectionTests(unittest.TestCase):
                 self.metadata,
             )
         self.assertEqual(selected, {"not_null_account_id"})
-        self.assertIn("DataBuck: critical rule [MEDIUM] not_null_account_id",
-                      output.getvalue())
+        self.assertNotIn("DataBuck: critical rule [", output.getvalue())
         self.client.models.generate_content.assert_called_once()
 
     def test_selection_provides_priorities_for_fresh_and_cached_results(self):
@@ -210,6 +211,82 @@ class CriticalSelectionTests(unittest.TestCase):
                 '[{"remove_id": 1, "keep_id": 2, "reason": "same key"}]',
                 ["dataset_check", "row_check"], {"dataset_check"},
             )
+
+    def test_combined_review_removes_duplicates_and_selects_survivors_in_one_call(self):
+        expectations = {
+            "BuckGPT_Rule_001": "`account_id` IS NOT NULL",
+            "not_null_account_id": "`account_id` IS NOT NULL",
+            "not_null_technical_id": "`technical_id` IS NOT NULL",
+        }
+        self.client.models.generate_content.return_value.text = json.dumps({
+            "duplicates": [{"remove_id": 2, "keep_id": 1,
+                            "reason": "Equivalent account ID checks"}],
+            "selected": [{"id": 1, "priority": "HIGH"},
+                         {"id": 3, "priority": "LOW"}],
+        })
+        with patch.dict(sys.modules, self.modules):
+            removed, priorities = _review_duplicates_and_critical_rules(
+                expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                self.metadata, {"not_null_account_id", "not_null_technical_id"},
+            )
+        self.assertEqual(removed, {"not_null_account_id"})
+        self.assertEqual(priorities, {"BuckGPT_Rule_001": "HIGH",
+                                      "not_null_technical_id": "LOW"})
+        self.client.models.generate_content.assert_called_once()
+        prompt = self.client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn("duplicates", prompt)
+        self.assertIn("selected", prompt)
+        self.assertNotIn("test-key", prompt)
+        self.df.limit.assert_not_called()
+
+    def test_combined_review_rejects_selection_of_removed_rule(self):
+        response = json.dumps({
+            "duplicates": [{"remove_id": 2, "keep_id": 1,
+                            "reason": "Equivalent checks"}],
+            "selected": [{"id": 2, "priority": "HIGH"}],
+        })
+        with self.assertRaisesRegex(ValueError, "removed duplicate cannot also be selected"):
+            _parse_combined_review(response, self.expectations, set(), 2)
+
+    def test_invalid_combined_review_falls_back_to_separate_calls(self):
+        self.client.models.generate_content.return_value.text = "[]"
+        with patch.dict(sys.modules, self.modules), \
+             patch("databuck.lake_rules._identify_duplicate_expectations",
+                   return_value={"not_null_technical_id"}) as deduplicate, \
+             patch("databuck.lake_rules._select_critical_expectations",
+                   return_value={"not_null_account_id"}) as select:
+            def fill_priorities(*args, **kwargs):
+                kwargs["priority_output"]["not_null_account_id"] = "HIGH"
+                return {"not_null_account_id"}
+            select.side_effect = fill_priorities
+            removed, priorities = _review_duplicates_and_critical_rules(
+                self.expectations, self.df,
+                {"domain_name": "banking", "gemini_api_key": "test-key"},
+                self.metadata, set(self.expectations),
+            )
+        self.assertEqual(removed, {"not_null_technical_id"})
+        self.assertEqual(priorities, {"not_null_account_id": "HIGH"})
+        self.assertEqual(set(select.call_args.args[0]), {"not_null_account_id"})
+        deduplicate.assert_called_once()
+        self.assertEqual(self.client.models.generate_content.call_count, 2)
+
+    def test_combined_review_reuses_valid_response(self):
+        self.client.models.generate_content.return_value.text = (
+            '{"duplicates":[],"selected":[{"id":1,"priority":"HIGH"}]}'
+        )
+        context = {"domain_name": "banking", "gemini_api_key": "test-key"}
+        with patch.dict(sys.modules, self.modules):
+            first = _review_duplicates_and_critical_rules(
+                self.expectations, self.df, context, self.metadata,
+                set(self.expectations),
+            )
+            second = _review_duplicates_and_critical_rules(
+                dict(reversed(list(self.expectations.items()))), self.df, context,
+                self.metadata, set(self.expectations),
+            )
+        self.assertEqual(first, second)
+        self.client.models.generate_content.assert_called_once()
 
     def test_action_review_uses_ids_and_defaults_omitted_rules_to_warn(self):
         self.df.limit.return_value.toJSON.return_value.collect.return_value = [

@@ -369,7 +369,9 @@ class ReferenceDocumentTests(unittest.TestCase):
                         "gemini_api_key": "test-key", "pdf_paths": [str(path)],
                     })
             self.assertEqual(rules[0]["source_document"], path.name)
-            self.assertIn("Source document: banking_policy.pdf", output.getvalue())
+            self.assertIn("BuckGPT: audit passed 1 document-backed and 0 general rules",
+                          output.getvalue())
+            self.assertNotIn("Source document: banking_policy.pdf", output.getvalue())
             self.assertEqual(generate.call_args.kwargs["allowed_sources"],
                              {path.name, "BuckGPT_Intel"})
             self.assertNotIn("maximum selected-rule count",

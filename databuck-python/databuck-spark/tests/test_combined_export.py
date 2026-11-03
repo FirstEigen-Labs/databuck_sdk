@@ -257,21 +257,18 @@ class CombinedExportTests(unittest.TestCase):
             "source_document": "banking_policy.pdf",
             "reference_context": "Balances must not be negative.",
         }]
-        def select_high(expectations, df, context, metadata, priority_output):
-            priority_output.update({
+        def review(expectations, df, context, metadata, auto_names):
+            return set(), {
                 "not_null_account_id": "HIGH",
                 "BuckGPT_Rule_001": "HIGH",
-            })
-            return set(priority_output)
+            }
 
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "expectations.json"
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
                  patch.object(DataBuck, "_discover_context_rules", return_value=buckgpt_rules), \
-                 patch("databuck.lake_rules._identify_duplicate_expectations",
-                       return_value=set()) as deduplicate, \
-                 patch("databuck.lake_rules._select_critical_expectations",
-                       side_effect=select_high) as select, \
+                 patch("databuck.lake_rules._review_duplicates_and_critical_rules",
+                       side_effect=review) as select, \
                  patch("databuck.lake_rules._classify_actions_with_llm", return_value={
                      "not_null_account_id": {"action": "drop", "reason": "Business key"},
                      "BuckGPT_Rule_001": {"action": "fail", "reason": "Policy control"},
@@ -283,8 +280,6 @@ class CombinedExportTests(unittest.TestCase):
             self.assertEqual(set(select.call_args.args[0]),
                              {"not_null_technical_id", "not_null_account_id",
                               "BuckGPT_Rule_001"})
-            self.assertEqual(set(deduplicate.call_args.args[0]),
-                             set(select.call_args.args[0]))
             self.assertEqual({item["column_name"] for item in select.call_args.args[3]
                               if "column_name" in item},
                              {"technical_id", "account_id"})
@@ -297,7 +292,7 @@ class CombinedExportTests(unittest.TestCase):
             self.assertIn("BuckGPT_Rule_001", exported["fail"])
             self.assertFalse(destination.with_name("expectations_all_rules.csv").exists())
 
-    def test_duplicate_review_runs_before_critical_selection_and_logs_counts(self):
+    def test_combined_review_removes_duplicates_and_logs_counts(self):
         profiling_rules = DiscoveredRules([{
             "ruleType": "Null Check", "columnName": "account_id",
             "parameters": {"nullThreshold": 0},
@@ -308,19 +303,16 @@ class CombinedExportTests(unittest.TestCase):
             "audit_status": "PASSED", "source_document": "policy.pdf",
             "reference_context": "Account ID is required.",
         }]
-        def select_high(expectations, df, context, metadata, priority_output):
-            priority_output["BuckGPT_Rule_001"] = "HIGH"
-            return {"BuckGPT_Rule_001"}
+        def review(expectations, df, context, metadata, auto_names):
+            return {"not_null_account_id"}, {"BuckGPT_Rule_001": "HIGH"}
 
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "expectations.json"
             output = io.StringIO()
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
                  patch.object(DataBuck, "_discover_context_rules", return_value=buckgpt_rules), \
-                 patch("databuck.lake_rules._identify_duplicate_expectations",
-                       return_value={"not_null_account_id"}) as deduplicate, \
-                 patch("databuck.lake_rules._select_critical_expectations",
-                       side_effect=select_high) as select, \
+                 patch("databuck.lake_rules._review_duplicates_and_critical_rules",
+                       side_effect=review) as select, \
                  patch("databuck.lake_rules._classify_actions_with_llm", return_value={
                      "BuckGPT_Rule_001": {"action": "fail", "reason": "Policy control"},
                  }), redirect_stdout(output):
@@ -328,10 +320,10 @@ class CombinedExportTests(unittest.TestCase):
                     "gemini_api_key": "test-key", "domain_name": "banking",
                     "business_context": "Account ID is required",
                 })
-            self.assertEqual(set(deduplicate.call_args.args[0]),
+            self.assertEqual(set(select.call_args.args[0]),
                              {"not_null_account_id", "BuckGPT_Rule_001"})
-            self.assertEqual(set(select.call_args.args[0]), {"BuckGPT_Rule_001"})
-            self.assertIn("reviewing duplicate rules (1 auto-discovered, 1 BuckGPT)",
+            self.assertIn("reviewing duplicates and selecting critical rules "
+                          "(1 auto-discovered, 1 BuckGPT candidates)",
                           output.getvalue())
             self.assertIn("removed 1 duplicate rules; 1 remain", output.getvalue())
             self.assertEqual(set(json.loads(destination.read_text())["fail"]),
@@ -354,22 +346,19 @@ class CombinedExportTests(unittest.TestCase):
             "reference_context": "Investor funding cannot exceed total funding.",
         }]
 
-        def select(expectations, df, context, metadata, priority_output):
-            priority_output.update({
+        def review(expectations, df, context, metadata, auto_names):
+            return set(), {
                 "not_null_account_id": "HIGH",
                 "not_null_technical_id": "MEDIUM",
                 "not_null_low_value": "LOW",
                 "BuckGPT_Rule_001": "HIGH",
-            })
-            return set(priority_output)
+            }
 
         with tempfile.TemporaryDirectory() as directory:
             for suffix in ("json", "yaml"):
                 destination = Path(directory) / ("expectations." + suffix)
-                with patch("databuck.lake_rules._identify_duplicate_expectations",
-                           return_value=set()), \
-                     patch("databuck.lake_rules._select_critical_expectations",
-                           side_effect=select), \
+                with patch("databuck.lake_rules._review_duplicates_and_critical_rules",
+                           side_effect=review), \
                      patch("databuck.lake_rules._classify_actions_with_llm", return_value={
                          "not_null_account_id": {"action": "drop", "reason": "Key"},
                          "not_null_technical_id": {"action": "warn", "reason": "Technical"},
@@ -467,18 +456,15 @@ class CombinedExportTests(unittest.TestCase):
             "sql": "SELECT * FROM {{DATAFRAME}} WHERE balance < 0",
             "audit_status": "PASSED",
         }]
-        def select_high(expectations, df, context, metadata, priority_output):
-            priority_output["BuckGPT_Rule_001"] = "HIGH"
-            return {"BuckGPT_Rule_001"}
+        def review(expectations, df, context, metadata, auto_names):
+            return set(), {"BuckGPT_Rule_001": "HIGH"}
 
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "expectations.yaml"
             with patch.object(DataBuck, "discover_rules", return_value=profiling_rules), \
                  patch.object(DataBuck, "_discover_context_rules", return_value=buckgpt_rules), \
-                 patch("databuck.lake_rules._identify_duplicate_expectations",
-                       return_value=set()), \
-                 patch("databuck.lake_rules._select_critical_expectations",
-                       side_effect=select_high) as select, \
+                 patch("databuck.lake_rules._review_duplicates_and_critical_rules",
+                       side_effect=review) as select, \
                  patch("databuck.lake_rules._classify_actions_with_llm") as classify:
                 DataBuck.discover(object(), str(destination), context={
                     "domain_name": "banking", "gemini_api_key": "test-key",

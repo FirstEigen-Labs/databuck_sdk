@@ -101,15 +101,6 @@ def discover_rules(df: Any, context: dict) -> list[dict[str, str]]:
     if not returned_rules:
         raise ValueError("Gemini audit rejected every generated rule")
 
-    for index, rule in enumerate(returned_rules, start=1):
-        print("\nRule {}: {}".format(index, rule["name"]))
-        print("Description: {}".format(rule["description"]))
-        print("Source document: {}".format(rule["source_document"]))
-        print("Reference context: {}".format(rule["reference_context"]))
-        print("Audit status: {}".format(rule["audit_status"]))
-        print("Audit reason: {}".format(rule["audit_reason"]))
-        print(rule["sql"])
-
     return returned_rules
 
 
