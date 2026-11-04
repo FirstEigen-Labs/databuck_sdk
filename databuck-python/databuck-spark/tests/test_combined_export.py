@@ -125,8 +125,12 @@ class CombinedExportTests(unittest.TestCase):
 
     def test_without_context_exports_only_profiling_rules_as_warn(self):
         profiling_rules = DiscoveredRules([{
+            "ruleId": "rule-1",
             "ruleType": "Null Check",
             "columnName": "subscriber_id",
+            "ruleName": "Subscriber ID required",
+            "expression": "subscriber_id IS NOT NULL",
+            "threshold": 0,
             "parameters": {"nullThreshold": 0},
         }])
         with tempfile.TemporaryDirectory() as directory:
@@ -140,6 +144,13 @@ class CombinedExportTests(unittest.TestCase):
             discover_context.assert_not_called()
             self.assertIn("Auto-discovery time: 2.50 seconds", output.getvalue())
             self.assertIn("Auto-discovered DataBuck rules: 1", output.getvalue())
+            self.assertIn("Rule 1 - Check name: Subscriber ID required", output.getvalue())
+            self.assertIn("'ruleId': 'rule-1'", output.getvalue())
+            self.assertIn("'ruleType': 'Null Check'", output.getvalue())
+            self.assertIn("'columnName': 'subscriber_id'", output.getvalue())
+            self.assertIn("'expression': 'subscriber_id IS NOT NULL'", output.getvalue())
+            self.assertIn("'threshold': 0", output.getvalue())
+            self.assertIn("'parameters': {'nullThreshold': 0}", output.getvalue())
             self.assertFalse(destination.with_name("expectations_all_rules.csv").exists())
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {
                 "warn": {"not_null_subscriber_id": "`subscriber_id` IS NOT NULL"},

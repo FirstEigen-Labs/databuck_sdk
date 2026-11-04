@@ -1361,6 +1361,11 @@ class DataBuck:
         discovery_seconds = time.perf_counter() - discovery_started
         print("Auto-discovery time: {:.2f} seconds".format(discovery_seconds))
         print("Auto-discovered DataBuck rules: {}".format(len(rules)))
+        for index, rule in enumerate(rules, start=1):
+            print("Rule {} - Check name: {}".format(
+                index, rule.get("ruleName") or rule.get("ruleType") or "Unnamed check"
+            ))
+            print("  Details: {}".format(rule))
         export_df = rules.prepare_for_lake(df)
         if context is not None:
             from .agentic_rules import has_rule_reference_context
