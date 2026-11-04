@@ -55,10 +55,8 @@ Downloading the JAR does not install it as a Databricks compute library.
 To use an existing JAR or another writable destination, set
 `DATABUCK_SDK_JAR` to that file path. If the download URL changes, set
 `DATABUCK_SDK_JAR_URL` to the new HTTPS URL before importing or running
-`python -m databuck`. The download is checked against
-the published JAR's SHA-256 hash. If the JAR content changes, publish a new
-Python package version with its new hash, or set
-`DATABUCK_SDK_JAR_SHA256` to the expected hash.
+`python -m databuck`. The download checks that the file is a valid JAR archive.
+Use a trusted JAR URL because the package does not verify a checksum.
 
 ### Databricks notebook setup
 

@@ -1,4 +1,3 @@
-import hashlib
 import io
 import os
 import subprocess
@@ -39,7 +38,6 @@ class JarDownloadTests(unittest.TestCase):
         payload = jar_bytes()
         with patch.dict(os.environ, {
             "DATABUCK_SPARK_SDK_JAR": str(self.jar),
-            "DATABUCK_SPARK_SDK_JAR_SHA256": hashlib.sha256(payload).hexdigest(),
         }, clear=True):
             with patch("databuck.sdk.urllib.request.urlopen",
                        return_value=io.BytesIO(payload)):
@@ -50,7 +48,6 @@ class JarDownloadTests(unittest.TestCase):
         payload = jar_bytes()
         environment = {
             "DATABUCK_SDK_JAR": str(self.jar),
-            "DATABUCK_SDK_JAR_SHA256": hashlib.sha256(payload).hexdigest(),
         }
         with patch.dict(os.environ, environment, clear=False):
             with patch("databuck.sdk.urllib.request.urlopen", return_value=io.BytesIO(payload)) as open_url:
@@ -68,7 +65,6 @@ class JarDownloadTests(unittest.TestCase):
         environment.pop("DATABUCK_SDK_AUTO_DOWNLOAD", None)
         environment["DATABUCK_SDK_JAR"] = str(self.jar)
         environment["DATABUCK_SDK_JAR_URL"] = source.as_uri()
-        environment["DATABUCK_SDK_JAR_SHA256"] = hashlib.sha256(payload).hexdigest()
         result = subprocess.run(
             [sys.executable, "-m", "databuck"],
             cwd=Path(__file__).resolve().parents[1],
@@ -88,7 +84,6 @@ class JarDownloadTests(unittest.TestCase):
         environment.pop("DATABUCK_SDK_AUTO_DOWNLOAD", None)
         environment["DATABUCK_SDK_JAR"] = str(self.jar)
         environment["DATABUCK_SDK_JAR_URL"] = source.as_uri()
-        environment["DATABUCK_SDK_JAR_SHA256"] = hashlib.sha256(payload).hexdigest()
         result = subprocess.run(
             [sys.executable, "-c", "import databuck, os; print(os.environ['DATABUCK_SDK_JAR'])"],
             cwd=Path(__file__).resolve().parents[1],
@@ -121,12 +116,12 @@ class JarDownloadTests(unittest.TestCase):
         self.assertFalse(self.jar.exists())
         self.assertEqual(list(self.jar.parent.iterdir()), [])
 
-    def test_checksum_mismatch_does_not_leave_partial_jar(self):
-        with patch("databuck.sdk.urllib.request.urlopen", return_value=io.BytesIO(jar_bytes())):
-            with self.assertRaisesRegex(RuntimeError, "SHA-256"):
-                DataBuck.download_jar(self.jar)
-        self.assertFalse(self.jar.exists())
-        self.assertEqual(list(self.jar.parent.iterdir()), [])
+    def test_valid_jar_downloads_without_checksum(self):
+        payload = jar_bytes()
+        with patch.dict(os.environ, {"DATABUCK_SDK_JAR": str(self.jar)}, clear=True):
+            with patch("databuck.sdk.urllib.request.urlopen", return_value=io.BytesIO(payload)):
+                self.assertEqual(DataBuck.download_jar(), str(self.jar.resolve()))
+        self.assertEqual(self.jar.read_bytes(), payload)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
-import hashlib
 import os
 import sys
 import tempfile
@@ -14,7 +13,6 @@ from .license import require_license
 
 JAR_URL = "https://tmplog1-pub.s3.us-east-1.amazonaws.com/databuck-sdk.jar"
 JAR_NAME = "databuck-sdk.jar"
-JAR_SHA256 = "2c25990fd5f0e6d6eec8302844637cd8d1f26d9afb9f0b0056b23eb9f7d56008"
 
 
 def _jar_setting(name, default=None):
@@ -69,7 +67,6 @@ class DataBuck:
             return str(jar.resolve())
 
         url = _jar_setting("JAR_URL", JAR_URL)
-        expected_sha256 = _jar_setting("JAR_SHA256", JAR_SHA256)
         temporary = None
         try:
             jar.parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +76,6 @@ class DataBuck:
                 dir=jar.parent, delete=False
             ) as output:
                 temporary = Path(output.name)
-                digest = hashlib.sha256()
                 with urllib.request.urlopen(url, timeout=60) as response:
                     total = None
                     if getattr(response, "headers", None) is not None:
@@ -89,7 +85,6 @@ class DataBuck:
                     next_report = 50 * 1024 * 1024
                     while chunk := response.read(1024 * 1024):
                         output.write(chunk)
-                        digest.update(chunk)
                         downloaded += len(chunk)
                         if downloaded >= next_report:
                             progress = f" / {total / (1024 * 1024):.1f} MiB" if total else ""
@@ -100,16 +95,13 @@ class DataBuck:
                             next_report += 50 * 1024 * 1024
             if not zipfile.is_zipfile(temporary):
                 raise ValueError("The downloaded file is not a valid JAR archive")
-            if digest.hexdigest().lower() != expected_sha256.lower():
-                raise ValueError("The downloaded JAR failed SHA-256 verification")
             os.replace(temporary, jar)
             print(f"databuck: JAR ready at {jar}", file=sys.stderr)
         except (OSError, ValueError, urllib.error.URLError) as exc:
             raise RuntimeError(
                 f"Could not download the DataBuck SDK JAR from {url} "
                 f"to {jar}: {exc}. Set DATABUCK_SDK_JAR to an existing "
-                "local JAR path or DATABUCK_SDK_JAR_URL to a reachable URL. "
-                "If the JAR changes, also set DATABUCK_SDK_JAR_SHA256."
+                "local JAR path or DATABUCK_SDK_JAR_URL to a reachable URL."
             ) from exc
         finally:
             if temporary is not None:
