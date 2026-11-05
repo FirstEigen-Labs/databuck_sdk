@@ -1,5 +1,10 @@
 # databuck-sdk
 
+[![PyPI version](https://img.shields.io/pypi/v/databuck-sdk.svg)](https://pypi.org/project/databuck-sdk/)
+[![Python versions](https://img.shields.io/pypi/pyversions/databuck-sdk.svg)](pyproject.toml)
+[![Publish to PyPI](https://github.com/FirstEigen-Labs/databuck_sdk/actions/workflows/publish.yml/badge.svg)](https://github.com/FirstEigen-Labs/databuck_sdk/actions/workflows/publish.yml)
+[![License: customer license](https://img.shields.io/badge/license-customer%20license-blue.svg)](LICENSE)
+
 Python wrapper for the DataBuck Spark SDK. It discovers data-quality rules from
 an existing Spark DataFrame or a registered Spark table and exports expectations
 that Databricks Lakeflow Declarative Pipelines can execute before downstream
@@ -20,7 +25,11 @@ expires_on=2027-12-31
 license_key=signed-key-created-by-the-issuer
 ```
 
-Set `DATABUCK_SDK_CONFIG_FILE` to its local path before importing the SDK.
+Set `DATABUCK_SDK_CONFIG_FILE` to the full local file path before importing the
+SDK. If the file is absent, import downloads `databucksdk.properties` from the
+DataBuck S3 URL to that path and validates its signature and dates. An existing
+file is reused. Without a configured path, the SDK uses
+`databuck/jars/databucksdk.properties` in the installed package.
 The license is valid through its `expires_on` date, inclusive. Renew it with
 a newly issued config file when it expires. Editing the dates or customer ID
 invalidates the signature.
@@ -39,7 +48,8 @@ python -m pip uninstall databuck-spark-sdk
 python -m pip install --upgrade databuck-sdk
 ```
 
-Importing `databuck` downloads `databuck-sdk.jar` from the DataBuck S3
+Importing `databuck` first downloads the signed properties file if needed,
+validates it, and then downloads `databuck-sdk.jar` from the DataBuck S3
 URL to `databuck/jars/` in the installed Python package, with progress output.
 The downloaded path is set in `DATABUCK_SDK_JAR` for the current Python
 process. A later import reuses the existing JAR.
@@ -48,8 +58,9 @@ default per-file upload limit. An internet connection and write access to the
 installed package directory are required for the first download.
 
 `python -m databuck` is an explicit download command that also prints the
-local path. Set `DATABUCK_SDK_AUTO_DOWNLOAD=0` before import to defer the
-download when offline. `DataBuck.jar_path()` returns the path after download.
+local path. Set `DATABUCK_SDK_AUTO_DOWNLOAD=0` before import to defer both
+downloads when offline; a valid local properties file is still required.
+`DataBuck.jar_path()` returns the path after download.
 Downloading the JAR does not install it as a Databricks compute library.
 
 To use an existing JAR or another writable destination, set
@@ -57,6 +68,16 @@ To use an existing JAR or another writable destination, set
 `DATABUCK_SDK_JAR_URL` to the new HTTPS URL before importing or running
 `python -m databuck`. The download checks that the file is a valid JAR archive.
 Use a trusted JAR URL because the package does not verify a checksum.
+Set `DATABUCK_SDK_CONFIG_FILE_URL` before import if the signed properties file
+must come from another trusted URL.
+
+## Licensing
+
+The SDK requires a signed `databucksdk.properties` file. It checks the customer
+ID, issue date, expiry date, and Ed25519 signature at import and before public
+SDK operations. The file remains valid through its expiry date, inclusive.
+See the [license notice](LICENSE) for the repository's licensing status and
+contact DataBuck for customer terms or renewal.
 
 ### Databricks notebook setup
 

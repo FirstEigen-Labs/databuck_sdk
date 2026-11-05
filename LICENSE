@@ -1,0 +1,11 @@
+DataBuck SDK License Notice
+
+This repository does not grant an open-source license to the DataBuck SDK.
+Use of the SDK requires a valid, signed databucksdk.properties file issued
+for the customer. The SDK verifies the customer ID, issue date, expiry date,
+and signature at import and before public SDK operations. The license remains
+valid through its expiry date, inclusive.
+
+The signed properties file is a technical license credential. This notice is
+not a customer agreement or a grant of rights. Contact DataBuck for the
+applicable license terms or a renewed credential.
