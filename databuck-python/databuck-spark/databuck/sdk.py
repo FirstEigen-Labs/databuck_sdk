@@ -108,6 +108,24 @@ class DataBuck:
                 temporary.unlink(missing_ok=True)
         return str(jar.resolve())
 
+    @staticmethod
+    def read_dataframe(spark, path, *, format="csv", **options):
+        """Load a Spark DataFrame with guidance for a known connector failure."""
+        try:
+            return spark.read.format(format).options(**options).load(path)
+        except Exception as exc:
+            details = str(exc)
+            if ("ServiceConfigurationError" in details
+                    and "org.apache.spark.sql.sources.DataSourceRegister" in details
+                    and "com.google.cloud.spark.bigquery.Scala212BigQueryRelationProvider"
+                    in details):
+                raise RuntimeError(
+                    f"Spark could not load the BigQuery connector for {format} data. "
+                    "Restart the compute and retry. If it persists, check for "
+                    "conflicting libraries."
+                ) from exc
+            raise
+
     # ------------------------------------------------------------------
     # PROFILE
     # ------------------------------------------------------------------

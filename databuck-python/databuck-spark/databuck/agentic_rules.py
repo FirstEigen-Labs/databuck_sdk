@@ -401,7 +401,7 @@ def _generate_and_audit_with_gemini(
             "`pip install google-genai`."
         ) from exc
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
     uploaded_files = []
     try:
         for pdf_path in pdf_paths:

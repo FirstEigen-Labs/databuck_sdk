@@ -479,7 +479,7 @@ Candidates (no sample records): {candidates}
         print("DataBuck: reusing duplicate rule review for unchanged inputs", flush=True)
         return set(_DUPLICATE_SELECTION_CACHE[cache_key])
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
     config = types.GenerateContentConfig(
         temperature=0.0, response_mime_type="application/json",
     )
@@ -628,7 +628,7 @@ Candidates (no sample records): {candidates}
         removed, priorities = cached
         return set(removed), dict(priorities)
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
     config = types.GenerateContentConfig(
         temperature=0.0, response_mime_type="application/json",
     )
@@ -812,7 +812,7 @@ Auto-discovered and BuckGPT candidates (no sample records):
               flush=True)
         return set(cached_priorities)
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
     config = types.GenerateContentConfig(
         temperature=0.0,
         response_mime_type="application/json",
@@ -970,7 +970,7 @@ Candidate expectations:
         sample=json.dumps(sample, default=str, ensure_ascii=False),
         candidates=json.dumps(candidates, ensure_ascii=False),
     )
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
     config = types.GenerateContentConfig(
         temperature=0.0, response_mime_type="application/json",
     )
