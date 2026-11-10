@@ -81,6 +81,10 @@ contact DataBuck for customer terms or renewal.
 
 ### Databricks notebook setup
 
+The SDK notebook was run on **Databricks Runtime 13.3 ML** (Spark **3.4.1**,
+Scala **2.12**). Check attached connector libraries separately if Spark fails
+while loading a data source.
+
 Run this once in the notebook to install the Python package:
 
 ```python
